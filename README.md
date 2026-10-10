@@ -1,3 +1,5 @@
+Important note: this is a fork of Jake18236's script. Go check it out!
+
 # Pokémon Showdown Teambuilder Mod
 
 A Tampermonkey userscript that adds some features that always annoyed me. Mostly for OMs.
@@ -5,7 +7,7 @@ A Tampermonkey userscript that adds some features that always annoyed me. Mostly
 ## Installation for Chrome, Firefox, Edge
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/).
-2. Click the **[Installation Link](https://github.com/Jake18236/Showdown-Teambuilder-Mod/releases/latest/download/showdown-teambuilder.user.js)**.
+2. Click the **[Installation Link](https://github.com/Lysio4/Showdown-Teambuilder-Mod/releases/latest/download/showdown-teambuilder.user.js)**.
 3. Click **Install** in Tampermonkey.
 4. Open Pokémon Showdown.
 
@@ -13,7 +15,7 @@ A Tampermonkey userscript that adds some features that always annoyed me. Mostly
 
 1. Download Userscripts on the App Store
 2. Enable the extension
-3. Click the **[Installation Link](https://github.com/Jake18236/Showdown-Teambuilder-Mod/releases/latest/download/showdown-teambuilder.user.js)**, click view, and install the code as an userscript.
+3. Click the **[Installation Link](https://github.com/Lysio4/Showdown-Teambuilder-Mod/releases/latest/download/showdown-teambuilder.user.js)**, click view, and install the code as an userscript.
 
 
 
@@ -104,5 +106,3 @@ A Tampermonkey userscript that adds some features that always annoyed me. Mostly
 <img width="404" height="339" alt="Screenshot 2026-09-29 211715" src="https://github.com/user-attachments/assets/8ee2d838-9577-4381-964e-c03eff493e97" />
 <img width="403" height="402" alt="Screenshot 2026-09-30 085614" src="https://github.com/user-attachments/assets/5c9e071e-eafb-40ce-b0f5-0c4d28016387" />
 <img width="412" height="402" alt="Screenshot 2026-09-30 085500" src="https://github.com/user-attachments/assets/153dd965-d45f-47d1-8b82-3729382a130d" />
-
-  
