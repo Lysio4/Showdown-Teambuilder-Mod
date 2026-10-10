@@ -4,7 +4,7 @@
 // @namespace    https://github.com/Jake18236/showdown-teambuilder-mod
 // @version      10.1.0
 // @description  Adds Teambuilder and damage calculator support for some OMs
-// @match        https://play.pokemonshowdown.com/*
+// @match        https://showdown.lysio.ovh/*
 // @match        https://calc.pokemonshowdown.com/*
 // @grant        none
 // @run-at       document-start
@@ -5669,7 +5669,7 @@
         parseGodlyGiftRestricted,
         isTierShiftFormat: (room) => getActiveMod(room) === MOD.TIER_SHIFT,
         isMixAndMegaFormat: (room) => getActiveMod(room) === MOD.MIX_AND_MEGA,
-        isBadNBoostedFormat: (room) => getActiveMod(room) === MOD.BAD_N_BOOSTED, 
+        isBadNBoostedFormat: (room) => getActiveMod(room) === MOD.BAD_N_BOOSTED,
         isScalemonsFormat: (room) => getActiveMod(room) === MOD.SCALEMONS,
         isGodlyGiftFormat,
         isTierShiftAAAFormat,
