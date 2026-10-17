@@ -2,9 +2,10 @@
 // @name         Pokémon Showdown Teambuilder QOL
 // @author       jl
 // @namespace    https://github.com/Jake18236/showdown-teambuilder-mod
-// @version      10.1.0
+// @version      12.0.0
 // @description  Adds Teambuilder and damage calculator support for some OMs
 // @match        https://showdown.lysio.ovh/*
+// @match        https://smogtours.psim.us/*
 // @match        https://calc.pokemonshowdown.com/*
 // @grant        none
 // @run-at       document-start
@@ -72,6 +73,16 @@
     const stripGen = (id) => String(id || '').replace(/^gen\d+/, '');
 
     // Order matters: first match wins.
+
+    const isNationalDexFormat = (format) =>
+    fmtHas(format, 'nationaldex', 'natdex');
+
+    const isNationalDexMixAndMegaFormat = (format) =>
+    isNationalDexFormat(format) && fmtHas(format, 'mixandmega');
+
+    const isStandardMixAndMegaFormat = (format) =>
+    fmtHas(format, 'mixandmega') && !isNationalDexFormat(format);
+
     const FORMAT_MOD_KEYWORDS = [
         ['tiershift', MOD.TIER_SHIFT],      // also covers tiershiftaaa
         ['mixandmega', MOD.MIX_AND_MEGA],   // covers gen9nationaldexmixandmega
@@ -439,11 +450,18 @@
 
     const isBaseForme = (sp) => sp.name === (sp.baseSpecies || sp.name);
 
+    // "Urshifu" bans every forme; "Urshifu-Base" / "Urshifu-Single-Strike" only
+    // resolve to Urshifu via aliasing, so they ban that one forme.
+    const bansWholeSpecies = (token, sp) =>
+    toID(token) === toID(sp.baseSpecies || sp.name);
+
     // Shared by Convergence and the generic per-format banlists.
     function parseBanSections(sections) {
         const bans = {
             species: new Set(), baseSpecies: new Set(), tiers: new Set(),
             unbanned: new Set(), unbannedBase: new Set(), abilities: new Set(),
+            restricted: new Set(),
+            restrictedBase: new Set(),
         };
         let sawNonSpeciesBan = false;
 
@@ -454,16 +472,19 @@
                 continue;
             }
 
-            const sp = Dex.species.get(token);
+            let sp = Dex.species.get(token);
+            let formeOnly = false;
+            if (!sp?.exists && /-base$/i.test(token)) {
+                sp = Dex.species.get(token.replace(/-base$/i, ''));
+                formeOnly = true; // bans just the base forme, not the whole species
+            }
             if (!sp?.exists) {
-                // Item / move / clause / ability. Only abilities matter here.
                 const ab = Dex.abilities.get(token);
                 if (ab?.exists) bans.abilities.add(ab.id);
                 sawNonSpeciesBan = true;
                 continue;
             }
-            // A base-species ban covers every forme; a forme ban only that forme.
-            (isBaseForme(sp) ? bans.baseSpecies : bans.species).add(sp.id);
+            ((formeOnly || !bansWholeSpecies(token, sp)) ? bans.species : bans.baseSpecies).add(sp.id);
         }
 
         // Evasion Abilities Clause isn't in the /tier output, so (as before) it
@@ -477,13 +498,29 @@
             const sp = Dex.species.get(token);
             if (!sp?.exists) continue;
             bans.unbanned.add(sp.id);
-            if (isBaseForme(sp)) bans.unbannedBase.add(sp.id);
+            if (bansWholeSpecies(token, sp)) bans.unbannedBase.add(sp.id);
+        }
+
+        for (const token of sections.Restricted || []) {
+            const sp = Dex.species.get(token);
+            if (!sp?.exists) continue;
+
+            const tokenId = toID(token);
+            const baseId = toID(sp.baseSpecies || sp.name);
+
+            // Only an explicit base-species entry restricts every forme.
+            if (tokenId === toID(sp.name) && sp.id === baseId) {
+                bans.restrictedBase.add(baseId);
+            } else {
+                // Preserve forme-specific restrictions, including aliases.
+                bans.restricted.add(sp.id);
+            }
         }
 
         return bans;
     }
 
-    function isBannedByList(bans, sp) {
+    function isBannedByList(bans, sp, ignoreTiers = false) {
         if (!bans || !sp?.exists) return false;
 
         const baseId = toID(sp.baseSpecies || sp.name);
@@ -491,7 +528,7 @@
 
         return bans.species.has(sp.id) ||
             bans.baseSpecies.has(baseId) ||
-            (!!sp.tier && bans.tiers.has(toID(sp.tier)));
+            (!ignoreTiers && !!sp.tier && bans.tiers.has(toID(sp.tier)));
     }
 
     function parseTSABanlist(html) {
@@ -545,6 +582,17 @@
     // The search's `format` may or may not carry the "gen9" prefix depending
     // on the client version, so everything is keyed without it.
     function genericBanFormatId(format) {
+        const rawFormat = String(format || '').split('@@@')[0];
+        console.log(LOG, 'format ID diagnostic:', {
+            format,
+            rawFormat,
+            fmtId: fmtId(rawFormat),
+            stripped: stripGen(fmtId(rawFormat)),
+        });
+        console.log(LOG, 'format ID diagnostic:', {
+            searchFormat: format,
+            teamFormat: getActiveTeambuilderRoom()?.curTeam?.format,
+        });
         const id = stripGen(fmtId(String(format || '').split('@@@')[0]));
         if (!id || GENERIC_BAN_EXCLUDED.some((k) => id.includes(k))) return null;
         return id;
@@ -568,17 +616,23 @@
     function handleGenericBanlistRaw(html) {
         if (!html || !genericBanlists.size || !html.includes('<h2>')) return null;
 
+        // "natdex" and "nationaldex" are the same thing in format names.
+        const normFmt = (id) => id.replace(/natdex/g, 'nationaldex');
+
         const title = new DOMParser().parseFromString(html, 'text/html').querySelector('h2')?.textContent || '';
-        const titleId = stripGen(fmtId(title));
+        const titleId = normFmt(stripGen(fmtId(title)));
+        console.log(LOG, 'banlist reply title:', JSON.stringify(title), '| pending:', [...genericBanlists.keys()]);
+        const titleIsNatdex = titleId.includes('nationaldex');
 
-        let formatId = genericBanlists.has(titleId) ? titleId : null;
+        let formatId = [...genericBanlists.keys()].find((k) => normFmt(k) === titleId) || null;
 
-        // Title didn't match the id we asked for: if exactly one request is
-        // still waiting (sent within the last 15s), assume this is its reply.
+        // Title didn't match: if exactly one request is still waiting, assume it's
+        // the reply, but natdex-ness must agree in BOTH directions.
         if (!formatId) {
-            const waiting = [...genericBanlists.entries()].filter(
-                ([, e]) => !e.loaded && e.silent && Date.now() - e.sentAt < 15000
-            );
+            const waiting = [...genericBanlists.entries()].filter(([id, e]) =>
+                                                                  !e.loaded && e.silent && Date.now() - e.sentAt < 15000 &&
+                                                                  normFmt(id).includes('nationaldex') === titleIsNatdex
+                                                                 );
             if (waiting.length === 1 && /Bans\s*<\/b>\s*-/.test(html)) {
                 formatId = waiting[0][0];
                 console.log(LOG, `Banlist title "${title}" did not match "${formatId}"; assuming it is the reply.`);
@@ -593,6 +647,7 @@
         entry.bans = parseBanSections(sections);
         entry.loaded = true;
         console.log(LOG, `Loaded bans for ${title}`);
+
 
         const suppress = entry.silent;
         entry.silent = false; // later manual /tier replies show normally
@@ -612,6 +667,18 @@
         return null;
     }
 
+    function isRestrictedInFormat(search, species) {
+        const banFormat =
+              getActiveTeambuilderRoom()?.curTeam?.format || search.format;
+        const id = genericBanFormatId(banFormat);
+        if (!id) return false;
+        const entry = requestGenericBanlist(id);
+        const restricted = entry.loaded ? entry.bans?.restricted : null;
+        const restrictedBase = entry.loaded ? entry.bans?.restrictedBase : null;
+        if (!restricted?.size && !restrictedBase?.size) return false;
+        const baseId = toID(species.baseSpecies || species.name);
+        return restricted.has(species.id) || restrictedBase.has(baseId);
+    }
     // ---------- server message receiver ----------
 
     const RAW_HANDLERS = [
@@ -895,6 +962,7 @@
     // that forme's stat changes are measured against.
     function resolveMegaForme(dex, item) {
         if (!item?.exists) return null;
+        if (item.zMove || item.zMoveType) return null; // Z-crystals aren't Mega Stones
 
         const special = resolveSpecialMixAndMegaForme(dex, item);
         if (special) return special;
@@ -1021,8 +1089,8 @@
     }
 
     // Pre-Mega speed, using Showdown's own stat formula (IVs/EVs/level/nature).
-    function getPreMegaSpeed(set) {
-        const dex = window.room?.curTeam?.dex;
+    function getPreMegaSpeed(set, room = getActiveTeambuilderRoom()) {
+        const dex = room?.curTeam?.dex;
         const species = dex?.species?.get(set?.species);
         if (!species?.exists) return 0;
 
@@ -1066,7 +1134,7 @@
         if (!chart.find('.mnm-speed-note').length) {
             chart.find('.basestatscol').after($(
                 '<div class="mnm-speed-note" style="position:absolute;left:330px;top:350px;z-index:10;">' +
-                'Speed is <span class="mnm-speed-value">0</span> before Mega Evolving</div>'
+                'Speed is <span class="mnm-speed-value">0</span></div>'
             ));
         }
 
@@ -1323,6 +1391,27 @@
 
             refreshFusionSet(room, name);
         });
+    }
+
+    let mnmSpeedListenerInstalled = false;
+    function installMnmSpeedNoteListener() {
+        if (mnmSpeedListenerInstalled) return;
+        mnmSpeedListenerInstalled = true;
+
+        let timer = null;
+        const handler = (e) => {
+            if (!e.target?.closest?.('.statform')) return;
+            const room = getActiveTeambuilderRoom();
+            if (!room || getActiveMod(room) !== MOD.MIX_AND_MEGA) return;
+
+            // setTimeout so the slider/number has already taken its new value
+            clearTimeout(timer);
+            timer = setTimeout(() => updateMixAndMegaSpeedNote(room), 0);
+        };
+
+        for (const type of ['input', 'change', 'keyup', 'wheel']) {
+            document.addEventListener(type, handler, true);
+        }
     }
 
     let fusionListenerInstalled = false;
@@ -1956,7 +2045,7 @@
     const ALLOWED_POKEMON_FILTER_TYPES = [
         'type', 'move', 'ability', 'egggroup', 'tier', 'weak', 'resists', 'neutral',
         'natdex', 'fe', 'recovery', 'pivot', 'priority', 'removal', 'hazards', 'into', 'from',
-        'legendary', 'boxlegend', 'mythical', 'paradox', 'eeveelution',
+        'legendary', 'boxlegend', 'mythical', 'paradox', 'eeveelution', 'restricted', 'realbulk',
     ];
     // Toggle filters take no argument: typing the keyword and picking the
     // single suggestion adds/removes the chip. Value = display label.
@@ -1974,6 +2063,8 @@
         eeveelution: 'Eeveelution',
         removal: 'Removal',
         hazards: 'Hazards',
+        restricted: 'Restricted',
+        realbulk: 'Real Bulk',
     };
 
 
@@ -1983,9 +2074,22 @@
     const FROM_PREFIX = 'From ';
 
     const isFullyEvolved = (species) => !!species && (!species.evos || species.evos.length === 0);
+    // 252 HP / 252 Def or SpD (boosting nature), level 100, 31 IVs.
+    function realBulk(baseStats, stat) {
+        const hp = baseStats.hp === 1 ? 1 : 2 * baseStats.hp + 204;
+        return hp * Math.floor((2 * baseStats[stat] + 99) * 11 / 10);
+    }
+    const formatBulk = (n) => Math.round(n / 1000) + 'k';
+    const hasRealBulk = (engine) => !!getIntoFilterId(engine, 'realbulk');
+
+    function applyRealBulkToRowHtml(html, stats) {
+        if (typeof html !== 'string' || !stats) return html;
+        return html.replace(/(<em>(Def|SpD)<\/em><br>)[^<]*/g, (m, prefix, label) =>
+                            prefix + formatBulk(realBulk(stats, label === 'Def' ? 'def' : 'spd')));
+    }
 
     const SPECIES_GROUPS = {
-        // Sub-legendaries + Ultra Beasts + DLC legends (not box, not mythical)
+        // Sub-legendaries + legends (not box, not mythical)
         legendary: setOf(
             'articuno zapdos moltres raikou entei suicune regirock regice registeel latias latios ' +
             'uxie mesprit azelf heatran regigigas cresselia cobalion terrakion virizion ' +
@@ -2033,6 +2137,72 @@
     // Per-dex cache so we don't rescan the whole movedex per search row.
     const customToggleMoveIdCache = new WeakMap();
 
+    const STONE_PREFIX = 'Stone ';
+    const isStoneRowId = (id) => String(id).toLowerCase().startsWith(STONE_PREFIX.toLowerCase());
+    const isMnmFormat = (f) => fmtHas(f, 'mixandmega');
+
+    function requiresHeldItem(sp) {
+        return !!sp && !!(
+            sp.isMega || sp.isPrimal || sp.requiredItem ||
+            (sp.requiredItems && sp.requiredItems.length) || sp.battleOnly
+        );
+    }
+
+    function isMnmStoneItem(dex, item) {
+        if (!item?.exists) return false;
+        const forme = resolveMegaForme(dex, item);
+        if (!forme) return false;
+        if (item.megaStone || resolveSpecialMixAndMegaForme(dex, item)) return true;
+        return forme.formeSpecies.name !== forme.baseSpecies.name; // Rusted Sword etc.; skips Soul Dew
+    }
+
+    const mnmStoneCache = new WeakMap();
+    function getMnmStoneItems(dex) {
+        let list = mnmStoneCache.get(dex);
+        if (list) return list;
+
+        list = [];
+        for (const id of Object.keys(window.BattleItems || {})) {
+            const item = dex.items.get(id);
+            if (item?.exists && item.id === id && isMnmStoneItem(dex, item)) list.push(item);
+        }
+        list.sort((a, b) => a.name.localeCompare(b.name));
+        mnmStoneCache.set(dex, list);
+        return list;
+    }
+
+    function stoneSuggestions(engine, query) {
+        if (!isMnmFormat(engine?.typedSearch?.format)) return [];
+        const q = toSearchId(query);
+        if (q.length < 2) return [];
+
+        const dex = engine.dex || engine.typedSearch?.dex;
+        if (!dex) return [];
+
+        return getMnmStoneItems(dex)
+            .filter((it) => toSearchId(it.name).includes(q))
+            .sort((a, b) =>
+                  toSearchId(b.name).startsWith(q) - toSearchId(a.name).startsWith(q))
+            .slice(0, 8)
+            .map((it) => ['ability', STONE_PREFIX + it.id, 0, Math.min(q.length, it.name.length)]);
+    }
+
+    // Stats / types / ability of `speciesLike` holding the stone (null if n/a).
+    function mnmStoneView(dex, speciesLike, stoneId) {
+        if (!dex || !speciesLike?.name) return null;
+        const set = {species: speciesLike.name, item: stoneId};
+
+        const baseStats = mixAndMegaBaseStats(dex, set);
+        if (!baseStats) return null;
+
+        const ability = mixAndMegaFutureAbility(dex, set);
+        return {
+            baseStats,
+            types: mixAndMegaModifiedTypes(dex, set) || speciesLike.types,
+            abilities: ability ? {0: ability} : null,
+        };
+    }
+
     function computeCustomToggleMoveIds(dex, kind) {
         if (TOGGLE_MOVE_LISTS[kind]) {
             return TOGGLE_MOVE_LISTS[kind].filter((id) => dex.moves.get(id)?.exists);
@@ -2067,21 +2237,43 @@
 
     // `ctx` is the search instance, `original` native filter() so move-based
     // toggles reuse native 'move' filtering per qualifying move id.
+    const toggleMoveMatchCache = new WeakMap(); // search instance -> {format, map}
+
+    // True if the species can learn at least one move from the toggle's move list.
+    function canLearnAnyToggleMove(ctx, original, row, species, kind) {
+        const format = String(ctx.format || '');
+        let cache = toggleMoveMatchCache.get(ctx);
+        if (!cache || cache.format !== format) {
+            cache = {format, map: new Map()};
+            toggleMoveMatchCache.set(ctx, cache);
+        }
+
+        const key = kind + '|' + species.id;
+        if (cache.map.has(key)) return cache.map.get(key);
+
+        const result = getCustomToggleMoveIds(ctx.dex, kind)
+        .some((moveId) => pokemonMatchesMove(ctx, original, row, species, moveId));
+        cache.map.set(key, result);
+        return result;
+    }
+
     function pokemonMatchesCustomToggle(ctx, original, row, species, kind) {
         switch (kind) {
-            case 'recovery':
-            case 'pivot':
-            case 'priority':
-            case 'removal':
-            case 'hazards':
             case 'fe':
                 return isFullyEvolved(species);
+            case 'restricted': return isRestrictedInFormat(ctx, species);
             case 'legendary':
             case 'boxlegend':
             case 'mythical':
             case 'paradox':
             case 'eeveelution':
                 return speciesInGroup(species, kind);
+            case 'recovery':
+            case 'pivot':
+            case 'priority':
+            case 'removal':
+            case 'hazards':
+                return canLearnAnyToggleMove(ctx, original, row, species, kind);
             default:
                 return true;
         }
@@ -2095,12 +2287,17 @@
     // Suggestion rows for toggles that loosely prefix-match the query. Reuses
     // the 'ability' row type; the displayed text is swapped in by the
     // getResultName/renderRow patches below.
-    function customToggleSuggestions(query) {
+    const CUSTOM_TOGGLE_ALIASES = {realbulk: ['totalbulk', 'bulk']};
+    const NO_NEGATE_TOGGLES = new Set(['realbulk']);
+
+    function customToggleSuggestions(query, negated = false) {
         const q = toSearchId(query);
         const rows = [];
 
         for (const [key, label] of Object.entries(CUSTOM_TOGGLE_FILTERS)) {
-            if (!q || toSearchId(key).startsWith(q) || toSearchId(label).startsWith(q)) {
+            if (negated && NO_NEGATE_TOGGLES.has(key)) continue;
+            const names = [key, label, ...(CUSTOM_TOGGLE_ALIASES[key] || [])].map(toSearchId);
+            if (!q || names.some((n) => n.startsWith(q))) {
                 rows.push([
                     'ability',
                     CUSTOM_TOGGLE_PREFIX + key,
@@ -2225,16 +2422,28 @@
             const species = this.dex.species.get(row[1]);
             if (!species?.exists) return false;
 
-            // Each filter is tested on its own; a negated one flips the
-            // result. Everything must hold at once.
+            // Stone chip: judge every other filter on the stone-modified mon.
+            const stoneId = filters.find((f) => f[0] === 'stone')?.[1];
+            const view = stoneId ? mnmStoneView(this.dex, species, stoneId) : null;
+            const judged = view
+            ? Object.assign({}, species, {types: view.types, abilities: view.abilities || species.abilities})
+            : species;
+
             for (const [rawType, target] of filters) {
                 const negated = isNegatedFilterType(rawType);
                 const type = baseFilterType(rawType);
 
-                // natdex only widens the pool; it never rejects a row.
-                if (type === 'natdex') continue;
+                // natdex only widens the pool; stone only changes how rows are judged/shown.
+                if (type === 'natdex' || type === 'stone' || type === 'realbulk') continue;
 
-                const matches = pokemonFilterMatches(this, original, row, species, type, target);
+                let matches;
+                if (view && type === 'type') {
+                    matches = judged.types.includes(target);
+                } else if (view && view.abilities && type === 'ability') {
+                    matches = Object.values(view.abilities).some((a) => toID(a) === toID(target));
+                } else {
+                    matches = pokemonFilterMatches(this, original, row, judged, type, target);
+                }
                 if (negated ? matches : !matches) return false;
             }
 
@@ -2277,15 +2486,18 @@
     }
 
     function applyGenericBans(search, results, hasNatdex) {
-        const id = genericBanFormatId(search.format);
+        const banFormat =
+              getActiveTeambuilderRoom()?.curTeam?.format || search.format;
+        const id = genericBanFormatId(banFormat);
         if (!id) return results;
 
         const entry = requestGenericBanlist(id);
-        if (!entry.loaded || hasNatdex) return results;
+        if (!entry.loaded) return results;
+
 
         const bans = entry.bans;
 
-        // Pokébilities formats only care about banned native abilities, not species/tier bans.
+        // Pokébilities formats only care about banned native abilities.
         if (fmtHas(search.format, 'pokebilities')) {
             if (!bans.abilities.size) return results;
             return moveBannedToIllegal(
@@ -2295,9 +2507,11 @@
             );
         }
 
+        // Client tiers are the non-natdex ones, so don't trust them for natdex formats.
+        const ignoreTiers = fmtHas(search.format, 'natdex', 'nationaldex');
         return moveBannedToIllegal(
             search, results,
-            (sp) => isBannedByList(bans, sp),
+            (sp) => isBannedByList(bans, sp, ignoreTiers),
             () => 'Banned'
         );
     }
@@ -2337,6 +2551,8 @@
             };
             this.__qolIntoId = findChip('into');
             this.__qolFromId = findChip('from');
+            this.__qolStoneId = findChip('stone');
+            this.__qolRealBulk = Array.isArray(filters) && filters.some((f) => f[0] === 'realbulk');
 
             // "natdex" chip: use the complete Pokédex as the legal pool
             // (includes mons the format normally considers illegal).
@@ -2358,11 +2574,43 @@
 
             let results = original.call(this, filters, sortCol, reverseSort);
             if (!Array.isArray(results)) return results;
+            if (isMnmFormat(this.format)) {
+                results = dropEmptyHeaders(results.filter(
+                    (r) => r[0] !== 'pokemon' || !requiresHeldItem(this.dex.species.get(r[1]))
+                ));
+            }
 
             results = applyGenericBans(this, results, hasNatdex);
             return applyGodlyGiftLegality(this, results);
         }
                           );
+    }
+
+    const STONE_SORT = {lead: 150, ability: 118}; // px: icon+name columns, ability column (match the rows)
+
+    function renderItemSortRow(ui) {
+        const sortCol = ui.engine?.sortCol;
+        const stat = (key, text) =>
+        `<button class="sortcol statsortcol${sortCol === key ? ' cur' : ''}" data-qol-sort="${key}">${text}</button>`;
+
+        return '<li class="result"><div class="sortrow">' +
+            stat('hp', 'HP') + stat('atk', 'Atk') + stat('def', 'Def') +
+            stat('spa', 'SpA') + stat('spd', 'SpD') + stat('spe', 'Spe') + stat('bst', 'BST') +
+            '</div></li>';
+    }
+
+    // Puts the sort row above the item results (after sorting, so it never gets sorted away).
+    function patchItemSearchSortRow() {
+        patchMethod(window.BattleItemSearch?.prototype, 'getResults', '__qolItemSortRowPatched', (original) =>
+                    function (...args) {
+            const results = original.apply(this, args);
+            if (!Array.isArray(results) || !isMnmFormat(this.format)) return results;
+            if (!(this.set?.species || getActiveTeambuilderRoom()?.curSet?.species)) return results;
+            if (results.some((r) => r[0] === 'html' && String(r[1]).includes('qol-itemsortrow'))) return results;
+            return [['html', ITEM_SORT_ROW_HTML], ...results];
+        }
+                   );
+        return true;
     }
 
     // ====================================================================
@@ -2681,7 +2929,7 @@
             test: (m) => HAZARD_MOVES.has(m.id),
         },
         pivot: {
-            label: 'Pivot', aliases: ['uturn'],
+            label: 'Pivot', aliases: [''],
             desc: 'Switches the user out after use',
             test: (m) => PIVOT_MOVES.has(m.id) || !!moveField(m, 'selfSwitch'),
         },
@@ -2713,7 +2961,7 @@
 
         bypassprotect: {
             label: 'Bypasses Protect',
-            aliases: ['bypassprotection', 'bypassesprotection', 'breaksprotect', 'ignoreprotect', 'feint'],
+            aliases: ['bypassprotection', 'bypassesprotection', 'breaksprotect', 'ignoreprotect', ''],
             desc: 'Hits through Protect',
             test: bypassesProtect,
         },
@@ -2722,6 +2970,7 @@
             desc: 'Hits multiple targets',
             test: isSpreadMove,
         },
+        thaws: flagToggle('defrost', 'Thaws', 'Thaws the user when used (Flame Wheel, Scald...)', ['thaw', 'thawing', 'defrost', 'unfreeze']),
     };
 
     const MOVE_TOGGLES = Object.assign({}, CORE_MOVE_TOGGLES, buildStatToggles(), UTILITY_MOVE_TOGGLES);
@@ -3074,6 +3323,14 @@
                 // default (Enter) selection.
                 const native = (original.call(engine, query) || []).filter((row) => !isReservedToggleCollisionRow(row));
                 const custom = customToggleSuggestions(raw);
+                const stones = stoneSuggestions(engine, raw);
+
+                if (!custom.length && !stones.length) return native;
+
+                const head = [];
+                if (custom.length) head.push(['header', 'Mod Filters'], ...custom);
+                if (stones.length) head.push(['header', 'Mega Stones'], ...stones);
+                return (engine.results = head.concat(native));
 
                 if (!custom.length) return native;
                 return (engine.results = [['header', 'Mod Filters'], ...custom].concat(native));
@@ -3085,7 +3342,7 @@
             if (!q) {
                 // Bare "!": every toggle plus every type. Abilities/moves only
                 // show once you type their name (too many to list).
-                results = [['header', 'Not'], ...customToggleSuggestions('')];
+                results = [['header', 'Not'], ...customToggleSuggestions('', true)];
                 for (const typeName of Object.keys(window.BattleTypeChart || {})) {
                     results.push(['type', toSearchId(typeName), 0, typeName.length]);
                 }
@@ -3098,7 +3355,7 @@
                     (rowType === 'type' || rowType === 'ability' || rowType === 'move' || rowType === 'tier') &&
                     !Object.prototype.hasOwnProperty.call(CUSTOM_TOGGLE_FILTERS, toSearchId(rowId))
                 );
-                results = customToggleSuggestions(q).concat(suggestions);
+                results = customToggleSuggestions(q, true).concat(suggestions);
             }
 
             engine.results = results;
@@ -3151,6 +3408,16 @@
             }
         }
 
+        // Mega stone suggestion picked (one stone chip at a time).
+        if (isStr && isStoneRowId(rawValue)) {
+            const item = engine.dex.items.get(rawValue.slice(STONE_PREFIX.length));
+            console.log(LOG, 'stone pick:', rawValue, '->', item?.exists ? item.id : 'item not found');
+            if (item?.exists) {
+                engine.filters = (engine.filters || []).filter((f) => f[0] !== 'stone');
+                return pushPokemonFilter(engine, 'stone', item.id, false); // skips the allow-list
+            }
+        }
+
         // Toggle suggestion picked (natdex/fe/recovery/...).
         if (isStr && rawValue.startsWith(CUSTOM_TOGGLE_PREFIX)) {
             const key = rawValue.slice(CUSTOM_TOGGLE_PREFIX.length);
@@ -3194,6 +3461,11 @@
             if (sp?.exists) return sp.name + ' into';
         }
 
+        if (isStoneRowId(id)) {
+            const item = engine.dex.items.get(id.slice(STONE_PREFIX.length));
+            if (item?.exists) return item.name;
+        }
+
         if (id.startsWith(CUSTOM_TOGGLE_PREFIX)) {
             const label = CUSTOM_TOGGLE_FILTERS[id.slice(CUSTOM_TOGGLE_PREFIX.length)];
             if (label) return engine.__qolNegateMode ? `Not ${label}` : label;
@@ -3222,10 +3494,239 @@
         move: {find: moveFind, textSearch: moveTextSearch, addFilter: moveAddFilter, getResultName: moveResultName},
     };
 
+    // Sorting for the item search (native item sort() throws on unknown columns).
+    const ITEM_SORT_KEYS = new Set([...STATS, 'bst', 'qoltype', 'qolability']);
+
+    function patchItemSearchSort() {
+        patchMethod(window.BattleItemSearch?.prototype, 'sort', '__qolItemSortPatched', (original) =>
+                    function (results, sortCol, reverseSort) {
+            if (!ITEM_SORT_KEYS.has(sortCol)) return original.call(this, results, sortCol, reverseSort);
+
+            const species = this.set?.species || getActiveTeambuilderRoom()?.curSet?.species;
+            if (!isMnmFormat(this.format) || !species) return results;
+
+            const base = this.dex.species.get(species);
+            const stoneRows = [];
+            const otherRows = [];
+            for (const row of results) {
+                if (row[0] !== 'item') continue;
+                const item = this.dex.items.get(row[1]);
+                const tmp = {species, item: item.id};
+                const stats = isMnmStoneItem(this.dex, item) ? mixAndMegaBaseStats(this.dex, tmp) : null;
+                if (!stats) { otherRows.push({row}); continue; }
+                stoneRows.push({
+                    row, stats,
+                    types: (mixAndMegaModifiedTypes(this.dex, tmp) || base?.types || []).join('/'),
+                    ability: mixAndMegaFutureAbility(this.dex, tmp) || '',
+                });
+            }
+
+            const order = reverseSort ? -1 : 1;
+            const byName = (a, b) => String(a.row[1]).localeCompare(String(b.row[1]));
+
+            stoneRows.sort((a, b) => {
+                if (sortCol === 'qolability') {
+                    // Stones that don't grant an ability always go last.
+                    if (!a.ability !== !b.ability) return a.ability ? -1 : 1;
+                    return a.ability.localeCompare(b.ability) * order || byName(a, b);
+                }
+                if (sortCol === 'qoltype') return a.types.localeCompare(b.types) * order || byName(a, b);
+
+                const value = (e) => (sortCol === 'bst' ? sumStats(e.stats) : e.stats[sortCol]);
+                return (value(b) - value(a)) * order || byName(a, b);
+            });
+
+            return stoneRows.concat(otherRows).map((e) => e.row);
+        }
+                   );
+        return true;
+    }
+
+    function decorateItemSortRow() {
+        const engine = getTeambuilderRoom()?.search?.engine;
+        if (engine?.typedSearch?.searchType !== 'item') return;
+
+        const bar = document.querySelector('.qol-itemsortrow');
+        if (!bar) return;
+
+        // Keep the bar above everything else in the results list (including the selected item).
+        const holder = bar.closest('li') || bar;
+        const list = holder.parentElement;
+        if (list && list.firstElementChild !== holder) list.insertBefore(holder, list.firstElementChild);
+
+        const active = engine.sortCol || '';
+        const buttons = [...bar.querySelectorAll('button[data-sort]')];
+        for (const btn of buttons) btn.classList.toggle('cur', btn.dataset.sort === active);
+
+        // On phones, use a wrapping button layout instead of forcing the
+        // desktop column positions into the narrow viewport.
+        const isMobile = window.matchMedia('(max-width: 600px)').matches;
+
+        if (isMobile) {
+            bar.style.position = 'static';
+            bar.style.height = 'auto';
+            bar.style.display = 'flex';
+            bar.style.flexWrap = 'wrap';
+            bar.style.gap = '4px';
+            bar.style.padding = '4px';
+
+            for (const btn of buttons) {
+                btn.style.position = 'static';
+                btn.style.left = 'auto';
+                btn.style.top = 'auto';
+                btn.style.width = 'auto';
+                btn.style.flex = '1 0 38px';
+                btn.style.minWidth = '38px';
+                btn.style.boxSizing = 'border-box';
+                btn.style.padding = '4px 2px';
+            }
+
+            return;
+        }
+
+        // Restore desktop positioning if the viewport changes back to desktop.
+        bar.style.display = '';
+        bar.style.flexWrap = '';
+        bar.style.gap = '';
+        bar.style.padding = '';
+
+        for (const btn of buttons) {
+            btn.style.position = '';
+            btn.style.left = '';
+            btn.style.top = '';
+            btn.style.width = '';
+            btn.style.flex = '';
+            btn.style.minWidth = '';
+            btn.style.boxSizing = '';
+            btn.style.padding = '';
+        }
+
+        const row = document.querySelector('li.result a[data-entry^="item|"] .statcol')?.closest('a');
+        if (!row) return;
+
+        const targets = [
+            row.querySelector('.typecol'),
+            row.querySelector('.abilitycol'),
+            ...row.querySelectorAll('.statcol'),
+            row.querySelector('.bstcol'),
+        ];
+        const barLeft = bar.getBoundingClientRect().left;
+
+        bar.style.position = 'relative';
+        bar.style.height = '20px';
+        buttons.forEach((btn, i) => {
+            const col = targets[i];
+            if (!col) return;
+            const rect = col.getBoundingClientRect();
+            btn.style.position = 'absolute';
+            btn.style.top = '0';
+            btn.style.left = (rect.left - barLeft) + 'px';
+            btn.style.width = rect.width + 'px';
+        });
+    }
+
+    let stoneSortListenerInstalled = false;
+
+    function installStoneSortListener() {
+        if (stoneSortListenerInstalled) return;
+        stoneSortListenerInstalled = true;
+
+        const itemSortButton = (e) => e.target?.closest?.('[data-qol-sort]');
+
+        document.addEventListener('mousedown', (e) => {
+            const btn = itemSortButton(e);
+            if (!btn || e.button !== 0) return;
+
+            const room = getTeambuilderRoom();
+            const engine = room?.search?.engine;
+            if (!engine || engine.typedSearch?.searchType !== 'item') return;
+
+            e.preventDefault();            // keep focus in the search box
+            e.stopImmediatePropagation();
+
+            const col = btn.dataset.qolSort;
+            if (!col) {
+                engine.sortCol = null;
+                engine.reverseSort = false;
+            } else if (engine.sortCol !== col) {
+                engine.sortCol = col;
+                engine.reverseSort = false;
+            } else if (!engine.reverseSort) {
+                engine.reverseSort = true;
+            } else {
+                engine.sortCol = null;
+                engine.reverseSort = false;
+            }
+            console.log(LOG, 'item sort:', engine.sortCol, engine.reverseSort ? 'low-high' : 'high-low');
+
+            engine.results = null;
+            try { room.search.find?.(''); } catch (err) { console.warn(LOG, 'search.find failed:', err); }
+            refreshSearchUi(room);
+        }, true);
+
+        // The press already did the work; don't let the click reach the client too.
+        document.addEventListener('click', (e) => {
+            if (!itemSortButton(e)) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+        }, true);
+    }
+
+    const ITEM_SORT_ROW_HTML =
+          '<div class="sortrow qol-itemsortrow">' +
+          [['qoltype', 'Types'], ['qolability', 'Abilities'],
+           ['hp', 'HP'], ['atk', 'Atk'], ['def', 'Def'], ['spa', 'SpA'], ['spd', 'SpD'], ['spe', 'Spe'], ['bst', 'BST']]
+    .map(([key, text]) => {
+        const centered = key === 'qoltype' || key === 'qolability'
+        ? ' style="text-align:center;padding-left:0;padding-right:0"' : '';
+        return `<button class="sortcol statsortcol" data-sort="${key}"${centered}>${text}</button>`;
+    })
+    .join('') +
+          '</div>';
+
+    function patchItemSearchStoneHeader() {
+        patchMethod(window.BattleItemSearch?.prototype, 'getBaseResults', '__qolStoneHeaderPatched', (original) =>
+                    function () {
+            const results = original.call(this);
+            try {
+                if (!isMnmFormat(this.format)) return results;
+
+                const stones = getMnmStoneItems(this.dex);
+                if (!stones.length) return results;
+
+                const ids = new Set(stones.map((s) => s.id));
+                const rest = dropEmptyHeaders(
+                    results.filter((r) => !(r[0] === 'item' && ids.has(r[1])))
+                );
+                return [['header', 'Mix and Mega Items'], ...stones.map((s) => ['item', s.id]), ...rest];
+            } catch (e) {
+                console.error(LOG, 'Stone header failed:', e);
+                return results;
+            }
+        }
+                   );
+        return true; // best-effort: never block patchLoop
+    }
+
     // Picking a type from the "Weak / Resists / Neutral" list adds the chip directly.
     function patchEngineSelectResult() {
         return patchEngineMethod('selectResult', '__qolSelectResultPatched', (original) =>
                                  function (index) {
+            // Mega stone row picked (Mix and Mega "stone" chip)
+            if (this.typedSearch?.searchType === 'pokemon' && this.results) {
+                const picked = this.results[index === undefined ? this.selection : index];
+                if (picked?.[0] === 'ability' && isStoneRowId(picked[1])) {
+                    const item = this.dex.items.get(String(picked[1]).slice(STONE_PREFIX.length));
+                    if (item?.exists) {
+                        this.filters = (this.filters || []).filter((f) => f[0] !== 'stone');
+                        if (pushPokemonFilter(this, 'stone', item.id, false)) {
+                            this.selection = 0;
+                            return null;
+                        }
+                        console.warn(LOG, 'stone filter rejected; is "stone" in ALLOWED_POKEMON_FILTER_TYPES?');
+                    }
+                }
+            }
             const mode = this.__qolEffectivenessMode;
 
             if (mode && this.results) {
@@ -3247,6 +3748,7 @@
     function patchEngineSetType() {
         return patchEngineMethod('setType', '__qolSetTypePatched', (original) =>
                                  function (...args) {
+            if (this.typedSearch?.searchType === 'item') { this.sortCol = null; this.reverseSort = false; }
             resetPokemonModes(this);
             this.query = '';
             this.exactMatch = false;
@@ -3332,6 +3834,7 @@
             pp.after(btn);
         }
     }
+
     function patchSearchSort() {
         return patchMethod(window.BattlePokemonSearch?.prototype, 'sort', '__qolPatched', (original) =>
                            function (results, sortCol, reverseSort) {
@@ -3340,31 +3843,38 @@
 
             const dex = this.dex;
             const order = reverseSort ? -1 : 1;
+            const bulkSort = !!this.__qolRealBulk && (sortCol === 'def' || sortCol === 'spd');
+            const valueOf = (stats) =>
+            bulkSort ? realBulk(stats, sortCol)
+            : sortCol === 'bst' ? sumStats(stats)
+            : stats[sortCol];
             const sortBy = (statsFor) =>
-            results.sort((a, b) => {
-                const sa = statsFor(a[1]);
-                const sb = statsFor(b[1]);
-                return (sortCol === 'bst' ? sumStats(sb) - sumStats(sa) : sb[sortCol] - sa[sortCol]) * order;
-            });
+            results.sort((a, b) => (valueOf(statsFor(b[1])) - valueOf(statsFor(a[1]))) * order);
 
-            // "into X": sort by the cross-evolved stats.
             if (this.__qolIntoId) {
                 return sortBy((id) => {
                     const sp = dex.species.get(id);
                     return crossEvolveView(dex, sp, this.__qolIntoId)?.baseStats || sp.baseStats;
                 });
             }
-
-            // "X into": X is the base, each result is the nickname.
             if (this.__qolFromId) {
                 const base = dex.species.get(this.__qolFromId);
                 return sortBy((id) =>
                               crossEvolveView(dex, base, id)?.baseStats || dex.species.get(id).baseStats);
             }
+            if (this.__qolStoneId) {
+                return sortBy((id) => {
+                    const sp = dex.species.get(id);
+                    return mixAndMegaBaseStats(dex, {species: sp.name, item: this.__qolStoneId}) || sp.baseStats;
+                });
+            }
 
             const mod = getActiveMod();
-            if (!hasSearchListStats(mod)) return original.call(this, results, sortCol, reverseSort);
-
+            if (!hasSearchListStats(mod)) {
+                return bulkSort
+                    ? sortBy((id) => dex.species.get(id).baseStats)
+                : original.call(this, results, sortCol, reverseSort);
+            }
             return sortBy((id) => searchListStats(dex.species.get(id), mod));
         }
                           );
@@ -3373,9 +3883,16 @@
     function patchSearchRenderer() {
         return patchMethod(window.BattleSearch?.prototype, 'renderPokemonRow', '__qolPatched', (original) =>
                            function (pokemon, matchStart, matchLength, errorMessage, attrs) {
-            const call = (mon, err) => original.call(this, mon, matchStart, matchLength, err, attrs);
+            let shown = pokemon;
+            const call = (mon, err) => {
+                shown = mon;
+                return original.call(this, mon, matchStart, matchLength, err, attrs);
+            };
+            const finish = (html) =>
+            hasRealBulk(this.engine) && shown?.baseStats
+            ? applyRealBulkToRowHtml(html, shown.baseStats)
+            : html;
 
-            // Cross-evolved preview for "into X" / "X into" filters.
             if (pokemon) {
                 const dex = this.engine.dex;
                 const intoId = getIntoFilterId(this.engine);
@@ -3383,26 +3900,27 @@
 
                 let view = intoId ? crossEvolveView(dex, pokemon, intoId) : null;
                 if (!view && fromId) view = crossEvolveView(dex, dex.species.get(fromId), pokemon.id);
+                const stoneId = getIntoFilterId(this.engine, 'stone');
+                if (!view && stoneId) view = mnmStoneView(dex, pokemon, stoneId);
 
                 if (view) {
-                    return call(Object.assign({}, pokemon, {
+                    return finish(call(Object.assign({}, pokemon, {
                         baseStats: view.baseStats,
                         types: view.types,
                         abilities: view.abilities || pokemon.abilities,
-                    }), errorMessage);
+                    }), errorMessage));
                 }
             }
 
-            // Natdex: suppress the legality label.
             const filters = this.engine?.typedSearch?.filters ?? [];
             if (filters.some((f) => Array.isArray(f) && f[0] === 'natdex')) {
-                return call(pokemon, undefined);
+                return finish(call(pokemon, undefined));
             }
 
             const mod = getActiveMod();
-            if (!pokemon || !hasSearchListStats(mod)) return call(pokemon, errorMessage);
+            if (!pokemon || !hasSearchListStats(mod)) return finish(call(pokemon, errorMessage));
 
-            return call(Object.assign({}, pokemon, {baseStats: searchListStats(pokemon, mod)}), errorMessage);
+            return finish(call(Object.assign({}, pokemon, {baseStats: searchListStats(pokemon, mod)}), errorMessage));
         }
                           );
     }
@@ -3414,6 +3932,7 @@
     function patchSearchRowText() {
         return patchMethod(window.BattleSearch?.prototype, 'renderRow', '__qolEffectivenessTypeNamePatched', (original) =>
                            function (row, type, matchStart, matchEnd, errorMessage, attrs) {
+            if (type === 'sortitem') return renderItemSortRow(this);
             const renderLabelRow = (text) =>
             original.call(this, ['ability', 'noability'], 'ability', matchStart, matchEnd, errorMessage, attrs)
             .replace(/(<span class="col namecol"><b>)([^<]*)(<\/b>)/, `$1${text}$3`);
@@ -3429,6 +3948,11 @@
             if (id.startsWith(FROM_PREFIX)) {
                 const sp = dex?.species?.get(id.slice(FROM_PREFIX.length));
                 if (sp?.exists) return renderLabelRow(`${sp.name} into`);
+            }
+
+            if (isStoneRowId(id)) {
+                const item = dex?.items?.get(id.slice(STONE_PREFIX.length));
+                if (item?.exists) return renderLabelRow(item.name);
             }
 
             if (id.startsWith(CUSTOM_TOGGLE_PREFIX)) {
@@ -3482,6 +4006,8 @@
                     text = EFFECT_LABELS[kind] + ' ' + text.charAt(0).toUpperCase() + text.slice(1);
                 } else if (kind === 'from') {
                     text = Dex.species.get(text).name + ' Into';
+                }else if (kind === 'stone') {
+                    text = Dex.items.get(text).name;
                 } else if (kind === 'into') {
                     text = 'Into ' + Dex.species.get(text).name;
                 } else if (kind === 'move') {
@@ -3563,6 +4089,7 @@
                                                                                   function (...args) {
             const result = original.apply(this, args);
             applyModBaseStatColumn(this);
+            if (getActiveMod(this) === MOD.MIX_AND_MEGA && this.curSet?.species) updateMixAndMegaSpeedNote(this);
             return result;
         }
                                                                                  )
@@ -3599,14 +4126,40 @@
                           );
     }
 
+
+
     // Everything that reacts to a chooser pick:
     //   - fusion mods: apply the "into" / "X into" nickname
     //   - Camomons / Mix and Mega: live-refresh the type icons
+    // Rebuilds the chooser that is currently open (what clicking away and back does).
+    function rebuildOpenChooser(room) {
+        const engine = room?.search?.engine;
+        if (!engine) return;
+        if (engine.typedSearch) clearSearchCache(engine.typedSearch);
+        engine.results = null;
+        try { room.search.find?.(''); } catch (e) { console.warn(LOG, 'search.find failed:', e); }
+        refreshSearchUi(room);
+    }
+
+    // Redraws the held-item icon in the set's icon row from curSet.item.
+    function refreshItemIcon(room) {
+        const item = room?.curSet?.item;
+        const cell = room?.$?.('.setrow-icons .setcell:not(.setcell-typeicons)');
+        if (!cell?.length) return;
+        cell.html(item ? `<span class="itemicon" style="${Dex.getItemIcon(item)}"></span>` : '');
+    }
+
     function patchChartSet() {
         return patchMethod(window.TeambuilderRoom?.prototype, 'chartSet', '__qolChartSetPatched', (original) =>
                            function (val, selectNext) {
             const mod = getActiveMod(this);
             const chartName = this.curChartName;
+
+            // Capture the stone before Showdown changes the search state on selection.
+            const stoneId = chartName === 'pokemon'
+            ? getIntoFilterId(this.search?.engine, 'stone')
+            : null;
+
 
             let nickname = null;
             if (chartName === 'pokemon' && isFusionMod(mod)) {
@@ -3618,6 +4171,7 @@
             if (nickname && this.curSet) {
                 this.curSet.name = nickname;
                 this.$('input[name=nickname]').val(nickname);
+
                 this.save?.();
 
                 fusionLastNickname = null;
@@ -3629,9 +4183,90 @@
             if (mod === MOD.CAMOMONS || (mod === MOD.MIX_AND_MEGA && chartName === 'item')) {
                 refreshTypeIcons(this);
             }
+            if (mod === MOD.MIX_AND_MEGA && chartName === 'pokemon' && this.curSet && stoneId) {
+                const stone = this.curTeam?.dex?.items?.get(stoneId);
+
+                if (stone?.exists) {
+                    this.curSet.item = stone.name;
+                    this.$('input[name=item]').val(stone.name);
+                    refreshItemIcon(this);
+                    this.save?.();
+                    refreshTypeIcons(this);
+                    this.updateStatForm();
+                    this.updateStatGraph();
+
+                    rebuildOpenChooser(this);
+                    setTimeout(() => {
+                        if (getActiveTeambuilderRoom() === this) {
+                            rebuildOpenChooser(this);
+                            refreshItemIcon(this);
+                        }
+                    }, 0);
+                }
+            }
             return result;
         }
                           );
+    }
+    const STONE_COL = {
+        types: 68, // two 32px type icons
+        stat: 26, // each of the 6 stat columns
+        ability: 104, // ability column
+        gap: 4,
+        rowHeight: 30, // match the native row height
+        nudgeY: -2, // negative = move up; adjust if text still sits low/high
+        font: 12,
+    };
+
+    function patchItemRowStoneStats() {
+        patchMethod(window.BattleSearch?.prototype, 'renderItemRow', '__qolStoneItemRowPatched', (original) =>
+                    function (item, ...rest) {
+            const html = original.call(this, item, ...rest);
+            try {
+                const typed = this.engine?.typedSearch;
+                if (!isMnmFormat(typed?.format)) return html;
+
+                const dex = this.engine.dex || typed.dex;
+                const set = typed.set || getActiveTeambuilderRoom()?.curSet;
+                if (!dex || !set?.species || !isMnmStoneItem(dex, item)) return html;
+
+                const base = dex.species.get(set.species);
+                const tmp = {species: set.species, item: item.id};
+                const stats = mixAndMegaBaseStats(dex, tmp);
+                if (!base?.exists || !stats) return html;
+
+                const ability = mixAndMegaFutureAbility(dex, tmp);
+                const types = mixAndMegaModifiedTypes(dex, tmp) || base.types;
+                const {sortCol, reverseSort} = this.engine;
+
+                // Clickable column label (see the click handler in section 2).
+                const label = (key, text) => `<em>${text}</em>`;
+                const num = (key) => {
+                    const d = stats[key] - base.baseStats[key];
+                    if (!d) return String(stats[key]);
+                    return `<span style="font-weight:bold;color:${d > 0 ? '#2a7' : '#c33'}">${stats[key]}</span>`;
+                };
+
+                const names = {hp: 'HP', atk: 'Atk', def: 'Def', spa: 'SpA', spd: 'SpD', spe: 'Spe'};
+                const statCols = STATS.map((k) =>
+                                           `<span class="col statcol">${label(k, names[k])}<br>${num(k)}</span>`).join('');
+                const bstCol = `<span class="col bstcol">${label('bst', 'BST')}<br>${sumStats(stats)}</span>`;
+
+                const content =
+                      `<span class="col typecol">${typeIconsHtml(types)}</span>` +
+                      '<span style="float:left;min-height:26px">' +
+                      '<span class="col abilitycol" style="width:118px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
+                      (ability ? BattleLog.escapeHTML(ability) : '') + '</span></span>' +
+                      `<span style="float:left;min-height:26px">${statCols}${bstCol}</span>`;
+
+                return html.replace(/<span class="col itemdesccol">[\s\S]*?<\/span>/, () => content);
+            } catch (e) {
+                console.error(LOG, 'Stone item row failed:', e);
+                return html;
+            }
+        }
+                   );
+        return true;
     }
 
     // ====================================================================
@@ -3936,6 +4571,10 @@
             const sp = dex?.species?.get(id.slice(FROM_PREFIX.length));
             return sp?.exists ? `${sp.name} Into` : null;
         }
+        if (isStoneRowId(id)) {
+            const item = dex?.items?.get(id.slice(STONE_PREFIX.length));
+            return item?.exists ? item.name : null;
+        }
         return null;
     }
 
@@ -3980,11 +4619,13 @@
         }
     }
 
-    const DOM_DECORATORS = [
+        const DOM_DECORATORS = [
         ['donor icons', decorateDonorIcons],
         ['move filter rows', decorateMoveFilterRows],
         ['pokemon filter rows', decoratePokemonFilterRows],
         ['move prio header', decorateMovePrioHeader],
+        ['item sort row', decorateItemSortRow],
+        ['self challenge button', installSelfChallengeButton],
     ];
 
     let domDecoratorsInstalled = false;
@@ -4009,6 +4650,561 @@
                 }
             });
         }).observe(document.documentElement, {childList: true, subtree: true});
+    }
+
+
+    // ====================================================================
+    // SELF CHALLENGE
+    //   Main account challenges a throwaway guest over a 2nd WebSocket and
+    //   you choose for both sides. Session is persisted so a reload resumes.
+    // ====================================================================
+
+    const SELF = {
+        STORE: 'qol-self-session',
+        PREFS: 'qol-self-prefs',
+        MAX_AGE: 6 * 60 * 60 * 1000,
+    };
+
+    const selfEsc = (s) => BattleLog.escapeHTML(String(s ?? ''));
+    const selfWsUrl = () =>
+        `wss://${window.Config?.defaultserver?.host || 'sim3.psim.us'}/showdown/websocket`;
+
+    function selfLoad(key) {
+        try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; }
+    }
+    function selfSave(key, value) {
+        try {
+            if (value == null) localStorage.removeItem(key);
+            else localStorage.setItem(key, JSON.stringify(value));
+        } catch (e) { /* storage unavailable */ }
+    }
+
+    function selfPackedOf(t) {
+        try { const p = Storage.getPackedTeam?.(t); if (p) return p; } catch (e) { /* fall through */ }
+        if (typeof t?.team === 'string') return t.team;
+        return Array.isArray(t?.team) ? Storage.packTeam(t.team) : '';
+    }
+
+    // ---------- session ----------
+
+    function runSelfSession(cfg) {
+        const origReceive = app.receive;
+        const origSend = app.send;
+        const S = {
+            roomid: cfg.roomid || null, ws: null, over: false, stopping: false, bannerOn: false,
+            req: {p1: null, p2: null}, fresh: {p1: false, p2: false},
+            round: [], queue: [], choice: {p1: null, p2: null}, summary: {p1: '', p2: ''},
+            current: null, flushed: false, timers: [], retries: 0,
+        };
+        window.qolSelf = S;
+
+        const log = (...a) => console.log('[self]', ...a);
+        const needs = (r) => !!r && !r.wait;
+        const room = () => app.rooms?.[S.roomid];
+        const later = (fn, ms) => { const t = setTimeout(fn, ms); S.timers.push(t); return t; };
+        const toast = (msg) => { try { app.addPopupMessage(msg); } catch (e) { console.warn('[self]', msg); } };
+
+        const persist = () => selfSave(SELF.STORE, {
+            format: cfg.format, packedA: cfg.packedA, packedB: cfg.packedB,
+            wantName: cfg.wantName, roomid: S.roomid, savedAt: Date.now(),
+        });
+        const setRoom = (rid) => { if (S.roomid) return; S.roomid = rid; persist(); };
+
+        // ---- silence the challenge PM ----
+        const ownIds = () => [cfg.wantName, S.ws?.name].filter(Boolean).map(toSearchId);
+        const isNoise = (line) => {
+            const ids = ownIds();
+            if (line.startsWith('|pm|')) {
+                const p = line.split('|');
+                return ids.includes(toSearchId(p[2])) || ids.includes(toSearchId(p[3]));
+            }
+            if (line.startsWith('|updatechallenges|')) {
+                const flat = toSearchId(line);
+                return ids.some((id) => flat.includes(id));
+            }
+            return false;
+        };
+
+        // ---- banner ----
+        const SIDE_COLOR = {p1: '#2b6cb0', p2: '#c53030'};
+        function renderBanner() {
+            const host = room()?.el?.querySelector?.('.battle-controls') || document.querySelector('.battle-controls');
+            if (!host) return;
+            let el = host.querySelector(':scope > .qol-self-banner');
+            if (!S.bannerOn || S.over || !S.current) { el?.remove(); return; }
+
+            const side = S.current;
+            const r = S.req[side];
+            const mon = r?.teamPreview ? 'Team preview' : (r?.side?.pokemon?.find((p) => p.active)?.details || '').split(',')[0];
+            const idx = S.round.indexOf(side);
+            const step = S.round.length > 1 && idx >= 0 ? `${idx + 1}/${S.round.length} · ` : '';
+            const other = S.round.find((s) => s !== side && S.choice[s]);
+            const locked = other ? `${other.toUpperCase()} locked: ${S.summary[other]}` : '';
+            const back = idx > 0 && !S.flushed;
+            const key = [side, mon, step, locked, back].join('|');
+            if (el?.dataset.key === key) return;
+            if (!el) { el = document.createElement('div'); el.className = 'qol-self-banner'; host.prepend(el); }
+            el.dataset.key = key;
+            el.style.cssText = `background:${SIDE_COLOR[side]};color:#fff;padding:4px 8px;margin:0 0 4px;border-radius:4px;` +
+                'font-size:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap';
+            el.innerHTML = `<span><b>${step}Choosing for ${side.toUpperCase()}</b> — ${selfEsc(mon)}</span>` +
+                (locked ? `<span style="opacity:.85">${selfEsc(locked)}</span>` : '') +
+                (back ? '<button class="button" data-qol-self-back style="margin-left:auto;padding:4px 10px;cursor:pointer">← Back</button>' : '');
+        }
+
+        let raf = 0;
+        const mo = new MutationObserver(() => {
+            if (raf) return;
+            raf = requestAnimationFrame(() => { raf = 0; renderBanner(); });
+        });
+        mo.observe(document.body, {childList: true, subtree: true});
+
+        const onClick = (e) => {
+            if (!e.target.closest?.('[data-qol-self-back]')) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            S.back();
+        };
+        document.addEventListener('click', onClick, true);
+
+        const describe = (side, data) => {
+            const body = data.replace(/^\/(choose|team)\s+/, '').split('|')[0].trim();
+            const r = S.req[side];
+            let m = body.match(/^move\s+(\S+)(.*)$/);
+            if (m) {
+                const mv = r?.active?.[0]?.moves?.[Number(m[1]) - 1];
+                return (mv?.move || m[1]) + (m[2].trim() ? ` (${m[2].trim()})` : '');
+            }
+            m = body.match(/^switch\s+(\d+)/);
+            if (m) return 'switch to ' + (r?.side?.pokemon?.[Number(m[1]) - 1]?.details?.split(',')[0] || m[1]);
+            if (/^\d/.test(body)) return 'team order ' + body;
+            return body;
+        };
+
+        // ---- show a side's request in the room, always from P1's point of view ----
+        function inject(side) {
+            S.current = side;
+            S.bannerOn = true;
+            let tries = 0;
+            const go = () => {
+                if (S.over) return;
+                const rm = room();
+                if (rm?.battle?.atQueueEnd === false && tries++ < 50) return setTimeout(go, 100);
+                const r = S.req[side];
+                const shown = r?.side ? {...r, side: {...r.side, id: 'p1'}} : r;
+                origReceive.call(app, `>${S.roomid}\n|request|${JSON.stringify(shown)}`);
+                renderBanner();
+                log('showing', side);
+            };
+            setTimeout(go, 30);
+        }
+
+        S.back = () => {
+            const i = S.round.indexOf(S.current);
+            if (S.flushed || i <= 0) return;
+            const prev = S.round[i - 1];
+            S.choice[prev] = null;
+            S.summary[prev] = '';
+            S.queue = S.round.slice(i - 1);
+            inject(prev);
+        };
+
+        function tryStartRound() {
+            if (!(S.fresh.p1 && S.fresh.p2)) return;
+            S.fresh = {p1: false, p2: false};
+            S.choice = {p1: null, p2: null};
+            S.summary = {p1: '', p2: ''};
+            S.flushed = false;
+            S.queue = ['p1', 'p2'].filter((s) => needs(S.req[s]));
+            S.round = S.queue.slice();
+            persist(); // refresh savedAt
+            log('round', {rqid: [S.req.p1?.rqid, S.req.p2?.rqid], needs: S.round});
+            if (S.queue.length) inject(S.queue[0]); else { S.bannerOn = false; renderBanner(); }
+        }
+
+        function onRequest(side, r) {
+            // Same rqid again (reconnect / room.request fallback) is not a new round.
+            const dup = S.req[side]?.rqid != null && S.req[side].rqid === r.rqid;
+            S.req[side] = r;
+            if (dup) return;
+            S.fresh[side] = true;
+            tryStartRound();
+        }
+
+        const sendTo = (side, data) =>
+            side === 'p1' ? origSend.call(app, data, S.roomid) : S.ws.send(S.roomid + '|' + data);
+
+        function flush() {
+            S.flushed = true;
+            S.bannerOn = false;
+            renderBanner();
+            for (const side of ['p1', 'p2']) if (S.choice[side]) sendTo(side, S.choice[side]);
+            log('sent', {...S.choice});
+        }
+
+        function finish() {
+            if (S.over) return;
+            S.over = true;
+            S.bannerOn = false;
+            renderBanner();
+            setTimeout(() => S.stop(), 500);
+        }
+
+        // ---- main connection hooks ----
+        const wrappedReceive = function (data) {
+            try {
+                // Drop the PM / challenge traffic involving the guest.
+                if (typeof data === 'string' && !data.startsWith('>') && /\|(pm|updatechallenges)\|/.test(data)) {
+                    const lines = data.split('\n');
+                    const kept = lines.filter((l) => !isNoise(l));
+                    if (kept.length < lines.length) {
+                        data = kept.join('\n');
+                        if (!data.trim()) return;
+                    }
+                }
+
+                if (typeof data === 'string' && data.startsWith('>battle-')) {
+                    const nl = data.indexOf('\n');
+                    const rid = data.slice(1, nl);
+                    if (!S.roomid && S.ws?.name && data.includes('|title|') && data.includes(S.ws.name)) setRoom(rid);
+                    if (rid === S.roomid) {
+                        for (const l of data.slice(nl + 1).split('\n')) {
+                            if (l.startsWith('|request|') && l.length > 9) onRequest('p1', JSON.parse(l.slice(9)));
+                            else if (S.flushed && /^\|error\|\[(Invalid|Unavailable) choice\]/.test(l)) setTimeout(() => inject('p1'), 80);
+                            else if (/^\|(win|tie)\|/.test(l)) finish();
+                        }
+                    }
+                }
+            } catch (e) { console.error('[self] receive hook', e); }
+            return origReceive.call(this, data);
+        };
+        wrappedReceive.__original = origReceive; // keeps the userscript's patchLoop from re-wrapping
+        app.receive = wrappedReceive;
+
+        app.send = function (data, rm) {
+            const id = typeof rm === 'string' ? rm : rm?.id;
+            if (S.roomid && id === S.roomid && typeof data === 'string' && /^\/(choose|team)\b/.test(data)) {
+                const side = S.current;
+                if (S.flushed) { sendTo(side, data); S.bannerOn = false; renderBanner(); return; } // re-choice after an error
+                if (S.queue[0] === side) {
+                    S.choice[side] = data;
+                    S.summary[side] = describe(side, data);
+                    S.queue.shift();
+                    if (S.queue.length) inject(S.queue[0]); else flush();
+                    return;
+                }
+            }
+            return origSend.apply(this, arguments);
+        };
+
+        // ---- guest P2 ----
+        async function onGuestMessage(ws, s) {
+            if (S.stopping) console.log('[self] guest reply while stopping:', s.slice(0, 300));
+            const ch = s.match(/\|challstr\|([^\n]+)/);
+            if (ch && !ws.requested) {
+                ws.requested = true;
+                const url = `https://play.pokemonshowdown.com/action.php?act=getassertion&userid=${toSearchId(ws.wantName)}&challstr=${encodeURIComponent(ch[1])}`;
+                const assertion = (await (await fetch(url)).text()).trim();
+                if (assertion.startsWith(';')) {
+                    toast('Could not log in the guest opponent.');
+                    return S.stop();
+                }
+                ws.send(`|/trn ${ws.wantName},0,${assertion}`);
+            }
+
+            const u = s.match(/\|updateuser\| ?([^|]+)\|1\|/);
+            if (u && !ws.name && toSearchId(u[1]) === toSearchId(ws.wantName)) {
+                ws.name = u[1].trim();
+                S.retries = 0;
+                if (S.roomid) onGuestResumed(); else startChallenge(ws);
+            }
+
+            if (s.startsWith('>battle-')) {
+                const nl = s.indexOf('\n');
+                const rid = s.slice(1, nl);
+                setRoom(rid);
+                if (rid !== S.roomid) return;
+                for (const l of s.slice(nl + 1).split('\n')) {
+                    if (l.startsWith('|request|') && l.length > 9) onRequest('p2', JSON.parse(l.slice(9)));
+                    else if (l.startsWith('|error|')) {
+                        origReceive.call(app, `>${S.roomid}\n|error|P2: ${l.slice(7)}`);
+                        if (S.flushed && /\[(Invalid|Unavailable) choice\]/.test(l)) setTimeout(() => inject('p2'), 80);
+                    } else if (/^\|(win|tie)\|/.test(l)) finish();
+                }
+            }
+        }
+
+        function startChallenge(ws) {
+            ws.send('|/utm ' + cfg.packedB);
+            origSend.call(app, '/utm ' + cfg.packedA);
+            origSend.call(app, `/challenge ${ws.name}, ${cfg.format}`);
+            const accept = () => { if (!S.roomid && !S.stopping) ws.send(`|/accept ${app.user.get('name')}`); };
+            later(accept, 500);
+            later(accept, 4000);
+            log('challenging', ws.name, cfg.format);
+        }
+
+        // Reload / reconnect: the server rejoins both players to the battle on its own,
+        // so we only need requests from both sides again.
+        function onGuestResumed() {
+            log('guest reconnected, resuming', S.roomid);
+            const p1Fallback = () => {
+                const r = room()?.request;
+                if (!S.req.p1 && r?.side) onRequest('p1', r); // request arrived before our hook was installed
+            };
+            later(p1Fallback, 2500);
+            later(p1Fallback, 6000);
+            later(() => {
+                if (S.req.p2 || S.over) return;
+                toast('The self-battle could not be resumed (it may have ended).');
+                S.stop();
+            }, 20000);
+        }
+
+        function connect() {
+            if (S.stopping) return;
+            const ws = new WebSocket(selfWsUrl());
+            S.ws = ws;
+            ws.wantName = cfg.wantName;
+            ws.onmessage = (e) => {
+                onGuestMessage(ws, String(e.data)).catch((err) => console.error('[self] guest', err));
+            };
+            ws.onclose = () => {
+                if (S.stopping || S.over || S.ws !== ws) return;
+                if (!S.roomid || ++S.retries > 5) { log('guest connection lost'); return; }
+                later(connect, 2000); // keep the same name; the server puts us back in the battle
+            };
+        }
+
+                S.stop = (opts = {}) => {
+            if (S.stopping) return;
+            const ws = S.ws;
+            log('stop requested', {forfeit: !!opts.forfeit, wsState: ws?.readyState, roomid: S.roomid});
+
+            S.stopping = true;
+            S.over = true;
+            S.bannerOn = false;
+            S.timers.forEach(clearTimeout);
+            app.receive = origReceive;
+            app.send = origSend;
+            document.removeEventListener('click', onClick, true);
+            mo.disconnect();
+            renderBanner();
+
+            let closeDelay = 0;
+            if (opts.forfeit) {
+                if (ws?.readyState === WebSocket.OPEN && S.roomid) {
+                    ws.send(`${S.roomid}|Match stopped.`);
+                    setTimeout(() => { try { ws.send(`${S.roomid}|/forfeit`); } catch (e) { /* closed */ } }, 300);
+                    closeDelay = 1500; // keep the socket open until the forfeit has gone through
+                } else {
+                    log('could not forfeit: guest socket not open or no room id');
+                }
+            }
+            setTimeout(() => { try { ws?.close(); } catch (e) { /* already closed */ } }, closeDelay);
+
+            if (!opts.keepSession) selfSave(SELF.STORE, null);
+            log('stopped');
+        };
+
+        persist();
+        connect();
+        return S;
+    }
+
+    function startSelfChallenge(cfg) {
+        if (window.qolSelf && !window.qolSelf.over) {
+            app.addPopupMessage('A self-battle is already running.');
+            return;
+        }
+        if (!app.user?.get?.('named')) {
+            app.addPopupMessage('Log in before challenging yourself.');
+            return;
+        }
+        runSelfSession({
+            ...cfg,
+            wantName: `QolB${Math.floor(Math.random() * 90000 + 10000)}`,
+            roomid: null,
+        });
+    }
+
+    // Called once at boot: picks a saved session back up after a reload.
+    function resumeSelfChallenge() {
+        const saved = selfLoad(SELF.STORE);
+        if (!saved) return;
+        if (!saved.roomid || !saved.wantName || Date.now() - (saved.savedAt || 0) > SELF.MAX_AGE) {
+            selfSave(SELF.STORE, null);
+            return;
+        }
+
+        let tries = 0;
+        const timer = setInterval(() => {
+            const ready = window.app?.receive && window.app.send && window.BattleLog && document.body;
+            if (!ready) {
+                if (++tries > 1200) clearInterval(timer); // ~60s
+                return;
+            }
+            clearInterval(timer);
+            if (window.qolSelf && !window.qolSelf.over) return;
+            try {
+                runSelfSession(saved);
+            } catch (e) {
+                console.error('[self] resume failed:', e);
+            }
+        }, 50);
+    }
+
+    // ---------- popup (Showdown's own Popup so it matches the client) ----------
+
+    let selfPopupClass = null;
+
+    function selfTeamEntries() {
+        const out = [];
+        (window.Storage?.teams || []).forEach((t, index) => {
+            const formatKey = toSearchId(t?.format);
+            if (!t || !formatKey || !selfPackedOf(t)) return;
+            out.push({index, t, formatKey, raw: String(t.format)});
+        });
+        return out;
+    }
+
+    function getSelfPopupClass() {
+        if (selfPopupClass) return selfPopupClass;
+
+        selfPopupClass = window.Popup.extend({
+            type: 'semimodal',
+
+            events: {
+                'submit form': 'submit',
+                'change select[name=format]': 'fillTeams',
+                'click button[data-qol=cancel]': 'cancelSelf',
+                'click button[data-qol=stop]': 'stopSelf',
+            },
+
+            initialize() {
+                const running = window.qolSelf && !window.qolSelf.over;
+                if (running) {
+                    this.$el.html(
+                        '<div style="width:min(300px,78vw)">' +
+                        '<p><strong>Self-battle in progress</strong></p>' +
+                        '<p class="buttonbar">' +
+                        '<button type="button" data-qol="stop" class="button">Stop self-battle</button> ' +
+                        '<button type="button" data-qol="cancel" class="button">Close</button></p></div>'
+                    );
+                    return;
+                }
+
+                this.entries = selfTeamEntries();
+                this.formats = new Map();
+                for (const e of this.entries) {
+                    if (!this.formats.has(e.formatKey)) {
+                        this.formats.set(e.formatKey, {raw: e.raw, name: window.BattleFormats?.[e.formatKey]?.name || e.raw});
+                    }
+                }
+
+                if (!this.entries.length) {
+                    this.$el.html(
+                        '<div style="width:min(300px,78vw)"><p>You need at least one saved team in the Teambuilder.</p>' +
+                        '<p class="buttonbar"><button type="button" data-qol="cancel" class="button">Close</button></p></div>'
+                    );
+                    return;
+                }
+
+                const prefs = selfLoad(SELF.PREFS) || {};
+                const keys = [...this.formats.keys()].sort((a, b) =>
+                    this.formats.get(a).name.localeCompare(this.formats.get(b).name));
+                const formatOptions = keys.map((k) =>
+                    `<option value="${selfEsc(k)}">${selfEsc(this.formats.get(k).name)}</option>`).join('');
+                const sel = 'class="button" style="width:100%;box-sizing:border-box"';
+
+                this.$el.html(
+                    '<form style="width:min(300px,78vw)">' +
+                    '<p><strong>Challenge Yourself</strong></p>' +
+                    `<p><label class="label">Format<br><select name="format" ${sel}>${formatOptions}</select></label></p>` +
+                    `<p><label class="label">Your team<br><select name="teamA" ${sel}></select></label></p>` +
+                    `<p><label class="label">Opponent's team<br><select name="teamB" ${sel}></select></label></p>` +
+                    '<p class="buttonbar"><button type="submit" class="button"><strong>Challenge</strong></button> ' +
+                    '<button type="button" data-qol="cancel" class="button">Cancel</button></p></form>'
+                );
+
+                if (prefs.formatKey && this.formats.has(prefs.formatKey)) this.$('select[name=format]').val(prefs.formatKey);
+                this.fillTeams(null, prefs);
+            },
+
+            // Called on format change (event arg first) and once from initialize (prefs second).
+            fillTeams(e, prefs) {
+                const key = this.$('select[name=format]').val();
+                const list = this.entries.filter((en) => en.formatKey === key);
+                const opts = list.map((en) =>
+                    `<option value="${en.index}">${selfEsc((en.t.folder ? en.t.folder + '/' : '') + en.t.name)}</option>`).join('');
+                const a = this.$('select[name=teamA]').html(opts);
+                const b = this.$('select[name=teamB]').html(opts);
+                if (!list.length) return;
+
+                const byName = (name) => list.find((en) => en.t.name === name);
+                const pickA = byName(prefs?.nameA) || list[0];
+                const pickB = byName(prefs?.nameB) || list[1] || list[0];
+                a.val(String(pickA.index));
+                b.val(String(pickB.index));
+            },
+
+            submit(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                const key = this.$('select[name=format]').val();
+                const teamA = Storage.teams[Number(this.$('select[name=teamA]').val())];
+                const teamB = Storage.teams[Number(this.$('select[name=teamB]').val())];
+                const fmt = this.formats.get(key);
+                if (!teamA || !teamB || !fmt) return;
+
+                selfSave(SELF.PREFS, {formatKey: key, nameA: teamA.name, nameB: teamB.name});
+                this.close();
+                startSelfChallenge({format: fmt.raw, packedA: selfPackedOf(teamA), packedB: selfPackedOf(teamB)});
+            },
+
+            stopSelf() {
+                window.qolSelf?.stop?.({forfeit: true});
+                this.close();
+            },
+
+            cancelSelf() {
+                this.close();
+            },
+        });
+
+        return selfPopupClass;
+    }
+
+    function openSelfChallengePopup() {
+        if (!window.app?.addPopup || !window.Popup) return;
+        app.addPopup(getSelfPopupClass());
+    }
+
+    // ---------- main menu button (below Tournaments) ----------
+
+    function installSelfChallengeButton() {
+        if (IS_DAMAGE_CALC) return;
+
+        const tournaments = document.querySelector('.menugroup button[value="/smogtours"]');
+        const group = tournaments?.closest('.menugroup');
+        if (!group || group.querySelector('#qol-self-challenge')) return;
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.id = 'qol-self-challenge';
+        button.className = 'button mainmenu4'; // same look as Tournaments
+        button.style.cursor = 'pointer';
+        button.textContent = 'Challenge Yourself';
+        button.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            try { openSelfChallengePopup(); } catch (err) { console.error('[self] popup failed:', err); }
+        });
+
+        const row = document.createElement('p');
+        row.appendChild(button);
+        const after = tournaments.closest('p');
+        if (after) after.after(row); else group.appendChild(row);
     }
 
     // ====================================================================
@@ -5589,7 +6785,10 @@
             patchPokemonFilter(),
             patchMoveSearchFilters(),
             patchSearchCacheInvalidation(),
-
+            patchItemRowStoneStats(),
+            patchItemSearchStoneHeader(),
+            patchItemSearchSort(),
+            patchItemSearchSortRow(),
 
             // search: ability + move pools per format
             patchAbilitySearchResults(),
@@ -5693,7 +6892,10 @@
 
     patchLoop();
     installNatureSwapCamomonsListener();
-    installFusionNicknameListener();
+    installStoneSortListener();
+    installMnmSpeedNoteListener();
     installDomDecorators();
     installCoverageSeparatorFix();
+    resumeSelfChallenge();
+
 })();
