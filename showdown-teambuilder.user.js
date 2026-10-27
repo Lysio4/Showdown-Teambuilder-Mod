@@ -2,7 +2,7 @@
 // @name         Pokémon Showdown Teambuilder QOL
 // @author       jl
 // @namespace    https://github.com/Jake18236/showdown-teambuilder-mod
-// @version      15.0.0
+// @version      15.1.0
 // @description  Adds Teambuilder and damage calculator support for some OMs
 // @match        https://play.pokemonshowdown.com/*
 // @match        https://smogtours.psim.us/*
@@ -208,8 +208,7 @@
     // ---------- format stacking ----------
     //
     // A team's format can carry custom rules ("gen9ou@@@badnboostedmod, flippedmod"), which is how
-    // OMs are stacked (see "Import format"). This preserves format/source order; individual effect
-    // pipelines apply their own ordering rules, including Showdown's ModifySpecies priorities.
+    // OMs are stacked.
 
     const asMods = (m) => (Array.isArray(m) ? m : m ? [m] : []);
 
@@ -232,7 +231,7 @@
     }
 
     // ModifySpecies event handlers run by priority, high to low. Stable source
-    // order within a priority bracket follows the challenge code's rule order.
+    // order within a priority bracket follows the challenge code's rule order. I do that bc its random in showdowns code lol.
     function orderModsByShowdownPriority(mods) {
         return asMods(mods).map((mod, index) => ({
             mod,
@@ -2512,7 +2511,7 @@
         const kept = results.filter((r) => (test(r) ? (hit.push(r), false) : true));
         return hit.length ? [...dropEmptyHeaders(kept), ['header', header], ...hit] : results;
     }
-    
+
         // Re-applies the Banned / Restricted groups to any result list (also flat search / sort lists).
     function applyGroups(results, groups) {
         let out = results;
@@ -2543,7 +2542,7 @@
             }
         );
     }
-    
+
         function moveBannedAbilitiesToHeader(search, results) {
         search.__qolGroups = null;
         if (!Array.isArray(results)) return results;
@@ -2837,7 +2836,7 @@
     const baseFilterType = (type) => (isNegatedFilterType(type) ? type.slice(1) : type);
 
     const ALLOWED_POKEMON_FILTER_TYPES = [
-        'type', 'move', 'ability', 'egggroup', 'tier', 'weak', 'resists', 'neutral',
+        'type', 'color', 'move', 'ability', 'egggroup', 'tier', 'weak', 'resists', 'neutral',
         'natdex', 'hackmons', 'fe', 'recovery', 'pivot', 'priority', 'removal', 'hazards', 'into', 'from',
         'legendary', 'boxlegend', 'mythical', 'paradox', 'eeveelution', 'restricted', 'realbulk',
     ];
@@ -2864,6 +2863,21 @@
 
     // Namespaced pseudo-ids so suggestion rows can't collide with real ids.
     const CUSTOM_TOGGLE_PREFIX = 'is ';
+
+    const POKEMON_COLORS = ['Black', 'Blue', 'Brown', 'Gray', 'Green', 'Pink', 'Purple', 'Red', 'White', 'Yellow'];
+    const COLOR_ROW_PREFIX = 'color ';
+    const pokemonColorName = (value) => POKEMON_COLORS.find((color) =>
+        toSearchId(color) === toSearchId(value).replace(/^grey$/, 'gray')) || null;
+    const colorRowName = (id) => typeof id === 'string' && id.startsWith(COLOR_ROW_PREFIX)
+        ? pokemonColorName(id.slice(COLOR_ROW_PREFIX.length)) : null;
+
+    function colorSuggestions(query) {
+        const q = toSearchId(query).replace(/grey/g, 'gray');
+        return POKEMON_COLORS.filter((color) => {
+            const id = toSearchId(color);
+            return !q || [id, 'color' + id, 'colour' + id].some((name) => name.startsWith(q));
+        }).map((color) => ['ability', COLOR_ROW_PREFIX + toSearchId(color), 0, 0]);
+    }
     const INTO_PREFIX = 'Into ';
     const FROM_PREFIX = 'From ';
 
@@ -3107,6 +3121,7 @@
 
     // Mirrors DexSearch#addFilter's per-type normalization.
     function normalizePokemonFilterValue(engine, type, value) {
+        if (type === 'color') return pokemonColorName(value);
         if (type === 'type' || type === 'weak' || type === 'resists') return engine.capitalizeFirst(value);
         if (type === 'move') return toID(value);
         if (type === 'ability') return engine.dex.abilities.get(value).name;
@@ -3149,6 +3164,7 @@
             return pushPokemonFilter(engine, type, target, negated);
         }
         if (!ALLOWED_POKEMON_FILTER_TYPES.includes(type)) return false;
+        if (type === 'color' && !pokemonColorName(value)) return false;
 
         return pushPokemonFilter(engine, type, normalizePokemonFilterValue(engine, type, value), negated);
     }
@@ -3200,6 +3216,7 @@
 
     // Does `species` satisfy one (non-negated) filter?
     function pokemonFilterMatches(search, original, row, species, type, target) {
+        if (type === 'color') return pokemonColorName(species.color) === pokemonColorName(target);
         if (type === 'natdex' || type === 'hackmons') return pokemonFormatPool(search, type).ids.has(species.id);
         if (EFFECT_LABELS[type]) return pokemonMatchesEffectiveness(search.dex, species, type, target);
         if (type === 'into') return !!crossEvolveView(search.dex, species, target);
@@ -3351,8 +3368,10 @@
     function pokemonFormatPool(search, kind) {
         const gen = search.dex.gen;
         const hasNatdexTable = !!window.BattleTeambuilderTable?.[`gen${gen}natdex`];
+        // This chip selects a dex, not the National Dex OU banlist. AG includes
+        // every standard tier; the team's actual format bans still apply later.
         const format = `gen${gen}${kind === 'natdex'
-            ? (hasNatdexTable ? 'nationaldex' : 'ou') : 'purehackmons'}`;
+            ? (hasNatdexTable ? 'nationaldexag' : 'anythinggoes') : 'purehackmons'}`;
         let cache = pokemonFormatPoolCache.get(search);
         if (!cache || cache.dex !== search.dex || cache.table !== window.BattleTeambuilderTable) {
             cache = {dex: search.dex, table: window.BattleTeambuilderTable, pools: new Map()};
@@ -4209,13 +4228,15 @@
     function pokemonTextSearch(engine, original, query) {
         const poolFilters = (engine.filters || []).filter(([type]) =>
             ['natdex', 'hackmons'].includes(baseFilterType(type)));
+        const searchFilters = (engine.filters || []).filter(([type]) =>
+            ['natdex', 'hackmons', 'color'].includes(baseFilterType(type)));
         // Native textSearch bypasses getResults/filter. Keep pool membership
         // and legality in sync while typing as well as in the blank-query list.
         if (poolFilters.length || engine.typedSearch?.__qolPokemonPool) {
             engine.typedSearch.getResults(engine.filters, null, false);
         }
         const nativeSearch = (text) => dropEmptyHeaders((original.call(engine, text) || []).filter((row) =>
-            row[0] !== 'pokemon' || !poolFilters.length || engine.typedSearch.filter(row, poolFilters)));
+            row[0] !== 'pokemon' || !searchFilters.length || engine.typedSearch.filter(row, searchFilters)));
         const raw = String(query || '').trim();
         const negated = raw.startsWith('!');
         const q = (negated ? raw.slice(1) : raw).trim().toLowerCase();
@@ -4231,7 +4252,7 @@
                 // real "natdex" tier), then put ours first so they're the
                 // default (Enter) selection.
                 const native = nativeSearch(query).filter((row) => !isReservedToggleCollisionRow(row));
-                const custom = customToggleSuggestions(raw);
+                const custom = customToggleSuggestions(raw).concat(colorSuggestions(raw));
                 const stones = stoneSuggestions(engine, raw);
 
                 if (!custom.length && !stones.length) return native;
@@ -4249,7 +4270,7 @@
             if (!q) {
                 // Bare "!": every toggle plus every type. Abilities/moves only
                 // show once you type their name (too many to list).
-                results = [['header', 'Not'], ...customToggleSuggestions('', true)];
+                results = [['header', 'Not'], ...customToggleSuggestions('', true), ...colorSuggestions('')];
                 for (const typeName of Object.keys(window.BattleTypeChart || {})) {
                     results.push(['type', toSearchId(typeName), 0, typeName.length]);
                 }
@@ -4262,7 +4283,7 @@
                     (rowType === 'type' || rowType === 'ability' || rowType === 'move' || rowType === 'tier') &&
                     !Object.prototype.hasOwnProperty.call(CUSTOM_TOGGLE_FILTERS, toSearchId(rowId))
                 );
-                results = customToggleSuggestions(q, true).concat(suggestions);
+                results = customToggleSuggestions(q, true).concat(colorSuggestions(q), suggestions);
             }
 
             engine.results = results;
@@ -4296,6 +4317,11 @@
     function pokemonAddFilter(engine, original, entry) {
         const rawValue = entry?.[1];
         const isStr = typeof rawValue === 'string';
+        const color = colorRowName(rawValue);
+        if (color) {
+            return addPokemonSearchFilter(engine, 'color', color,
+                isNegatedFilterType(entry[0]) || engine.__qolNegateMode);
+        }
 
         // "Into X" suggestion picked (only one "into" chip at a time).
         if (isStr && rawValue.startsWith(INTO_PREFIX)) {
@@ -4348,7 +4374,7 @@
         }
 
         // Directly supplied positive custom filters (e.g. from the console).
-        if (EFFECT_LABELS[rawType] || CUSTOM_TOGGLE_FILTERS[rawType]) {
+        if (rawType === 'color' || EFFECT_LABELS[rawType] || CUSTOM_TOGGLE_FILTERS[rawType]) {
             return addPokemonSearchFilter(engine, rawType, entry[1], false);
         }
 
@@ -4357,6 +4383,8 @@
 
     function pokemonResultName(engine, original, result) {
         const id = typeof result?.[1] === 'string' ? result[1] : '';
+        const color = colorRowName(id);
+        if (color) return `${engine.__qolNegateMode ? 'Not ' : ''}${color}`;
 
         if (id.startsWith(INTO_PREFIX)) {
             const sp = engine.dex.species.get(id.slice(INTO_PREFIX.length));
@@ -4881,6 +4909,8 @@
 
             const id = type === 'ability' && typeof row?.[1] === 'string' ? row[1] : '';
             const dex = this.engine?.dex;
+            const color = colorRowName(id);
+            if (color) return renderLabelRow(`${color}`, this.engine?.__qolNegateMode ? 'Not ' : '');
 
             if (id.toLowerCase().startsWith(MOVE_ROW_PREFIX)) {
                 const info = moveFilterRowInfo(id);
@@ -4955,6 +4985,8 @@
 
                 if (EFFECT_LABELS[kind]) {
                     text = EFFECT_LABELS[kind] + ' ' + text.charAt(0).toUpperCase() + text.slice(1);
+                } else if (kind === 'color') {
+                    text = text;
                 } else if (kind === 'from') {
                     text = Dex.species.get(text).name + ' Into';
                 }else if (kind === 'stone') {
@@ -5018,6 +5050,27 @@
     // ====================================================================
 
     // Stat calculation for every mod.
+    // Like native Monotype, seed a removable chip only when adding a new slot.
+    // Searching or removing the chip must never silently reapply it.
+    function patchMonocolorAddPokemon() {
+        return patchMethod(window.TeambuilderRoom?.prototype, 'addPokemon', '__qolMonocolorPatched', (original) =>
+            function (...args) {
+                const result = original.apply(this, args);
+                const format = String(this.curTeam?.format || '').split('@@@')[0];
+                if (!fmtHas(format, 'monocolor', 'monocolour') || this.curSet?.species) return result;
+                const engine = this.search?.engine;
+                if (engine?.typedSearch?.searchType !== 'pokemon') return result;
+                const dex = this.curTeam.dex;
+                const first = this.curSetList?.find((set) => set.species && dex.species.get(set.species)?.exists);
+                const color = first && pokemonColorName(dex.species.get(first.species).color);
+                if (color && addPokemonSearchFilter(engine, 'color', color, false)) {
+                    this.search.filters = engine.filters;
+                    this.search.find('');
+                }
+                return result;
+            });
+    }
+
     function patchGetStat() {
         return patchMethod(window.TeambuilderRoom?.prototype, 'getStat', '__qolPatched', (original) =>
                            function (stat, set, evOverride, natureOverride) {
@@ -5582,6 +5635,8 @@
     function pokemonFilterRowLabel(rawId, negated) {
         const id = String(rawId).toLowerCase();
         const dex = getTeambuilderRoom()?.search?.engine?.dex;
+        const color = colorRowName(id);
+        if (color) return `${negated ? 'Not ' : ''}${color}`;
 
         if (id.startsWith(CUSTOM_TOGGLE_PREFIX)) {
             const label = CUSTOM_TOGGLE_FILTERS[id.slice(CUSTOM_TOGGLE_PREFIX.length)];
@@ -9641,6 +9696,7 @@
             patchSearchRenderer(),
 
             // teambuilder: stats, icons, chooser
+            patchMonocolorAddPokemon(),
             patchGetStat(),
             patchStatForm(),
             patchRenderSetTypeIcons(),
