@@ -2,7 +2,7 @@
 // @name         Pokémon Showdown Teambuilder QOL
 // @author       jl
 // @namespace    https://github.com/Jake18236/showdown-teambuilder-mod
-// @version      14.0.0
+// @version      15.1.0
 // @description  Adds Teambuilder and damage calculator support for some OMs
 // @match        https://showdown.lysio.ovh/*
 // @match        https://smogtours.psim.us/*
@@ -65,6 +65,7 @@
         CAMOMONS: 'camomons',
         FORTEMONS: 'fortemons',
         SKETCHMONS: 'sketchmons',
+        TYPEMONS: 'typemons',
         // Movepool / ability-list mods (no stat changes of their own)
         CONVERGENCE: 'convergence',
         ALPHABET_CUP: 'alphabetCup',
@@ -157,6 +158,7 @@
             id: MOD.SKETCHMONS, formatKeywords: ['sketchmons'],
             label: 'Sketchmons', challengeRule: 'sketchmonsmod',
         },
+        {id: MOD.TYPEMONS, providerKeywords: ['typemons'], label: 'Typemons'},
         {id: MOD.CONVERGENCE, providerKeywords: ['convergence'], label: 'Convergence'},
         {id: MOD.ALPHABET_CUP, providerKeywords: ['alphabetcup'], label: 'Alphabet Cup'},
         {id: MOD.ALL_MOVES, providerKeywords: ['camove'], label: 'Every Move'},
@@ -168,11 +170,11 @@
     ];
     const MOD_DEFINITION_BY_ID = new Map(MOD_DEFINITIONS.map((definition) => [definition.id, definition]));
     const MOD_BY_CALC_OM = new Map(MOD_DEFINITIONS
-        .filter((definition) => definition.calcOm)
-        .map((definition) => [definition.calcOm, definition.id]));
+                                   .filter((definition) => definition.calcOm)
+                                   .map((definition) => [definition.calcOm, definition.id]));
     const FORMAT_MOD_KEYWORDS = MOD_DEFINITIONS.flatMap((definition) =>
-        (definition.formatKeywords || []).map((keyword) => [keyword, definition.id])
-    );
+                                                        (definition.formatKeywords || []).map((keyword) => [keyword, definition.id])
+                                                       );
 
     function modFromFormat(format) {
         const id = fmtId(format);
@@ -184,15 +186,15 @@
 
     const isFusionMod = (mod) => MOD_DEFINITION_BY_ID.get(mod)?.exclusiveGroup === 'fusion';
     const FUSION_FORMAT_KEYWORDS = [...new Set(MOD_DEFINITIONS
-        .filter((definition) => definition.exclusiveGroup === 'fusion')
-        .flatMap((definition) => definition.formatKeywords || []))];
+                                               .filter((definition) => definition.exclusiveGroup === 'fusion')
+                                               .flatMap((definition) => definition.formatKeywords || []))];
     const isCrossFormat = (format) => fmtHas(format, ...FUSION_FORMAT_KEYWORDS);
 
     // Provider mods can coexist with the primary format mod (for example,
     // Camove is both Camomons and an all-moves format).
     const FORMAT_PROVIDER_KEYWORDS = MOD_DEFINITIONS.flatMap((definition) =>
-        (definition.providerKeywords || []).map((keyword) => [keyword, definition.id])
-    );
+                                                             (definition.providerKeywords || []).map((keyword) => [keyword, definition.id])
+                                                            );
 
     // ====================================================================
     // 2. ROOM HELPERS
@@ -206,8 +208,7 @@
     // ---------- format stacking ----------
     //
     // A team's format can carry custom rules ("gen9ou@@@badnboostedmod, flippedmod"), which is how
-    // OMs are stacked (see "Import format"). This preserves format/source order; individual effect
-    // pipelines apply their own ordering rules, including Showdown's ModifySpecies priorities.
+    // OMs are stacked.
 
     const asMods = (m) => (Array.isArray(m) ? m : m ? [m] : []);
 
@@ -230,15 +231,15 @@
     }
 
     // ModifySpecies event handlers run by priority, high to low. Stable source
-    // order within a priority bracket follows the challenge code's rule order.
+    // order within a priority bracket follows the challenge code's rule order. I do that bc its random in showdowns code lol.
     function orderModsByShowdownPriority(mods) {
         return asMods(mods).map((mod, index) => ({
             mod,
             index,
             priority: MOD_DEFINITION_BY_ID.get(mod)?.modifySpeciesPriority || 0,
         })).sort((a, b) =>
-            b.priority - a.priority || a.index - b.index
-        ).map(({mod}) => mod);
+                 b.priority - a.priority || a.index - b.index
+                ).map(({mod}) => mod);
     }
 
     // Mods a format string turns on by itself: its own mod, provider mods, and "@@@" rule mods.
@@ -300,7 +301,11 @@
     function modsForSearch(search) {
         const room = getActiveTeambuilderRoom();
         const team = room?.curTeam;
-        if (team && search && searchFormatId(team.format) === searchFormatId(search.format)) {
+        const engine = room?.search?.engine;
+        // PS strips generation, National Dex, doubles, etc. from search.format.
+        // Prefer ownership; comparing the raw format strings loses custom rules.
+        const owned = search && [engine?.typedSearch, engine?.moveSearch, engine?.abilitySearch].includes(search);
+        if (team && search && (owned || searchFormatId(team.format) === searchFormatId(search.format))) {
             return getActiveMods(room);
         }
         return modsFromFormatString(search?.format);
@@ -427,6 +432,7 @@
     const clearSearchCache = (search) => {
         search.baseResults = null;
         search.baseIllegalResults = null;
+        search.illegalReasons = null;
     };
 
     // Throws away the engine's results (and optionally the typed search's
@@ -668,6 +674,17 @@
     toID(token) === toID(sp.baseSpecies || sp.name);
 
     // Shared by Convergence and the generic per-format banlists.
+    const RESTRICTED_KEY = {abilities: 'restrictedAbilities', moves: 'restrictedMoves', items: 'restrictedItems'};
+    function classifyRuleToken(token) {
+        const ability = Dex.abilities.get(token);
+        if (ability?.exists) return {kind: 'abilities', id: ability.id};
+        const move = Dex.moves.get(token);
+        if (move?.exists) return {kind: 'moves', id: move.id};
+        const item = Dex.items.get(token);
+        if (item?.exists) return {kind: 'items', id: item.id};
+        return null;
+    }
+
     function parseBanSections(sections) {
         const bans = {
             species: new Set(), baseSpecies: new Set(), tiers: new Set(),
@@ -675,6 +692,7 @@
             restricted: new Set(),
             restrictedBase: new Set(),
             restrictedAbilities: new Set(), // "*Comatose": only usable by Pokémon that natively have it
+            moves: new Set(), items: new Set(), restrictedMoves: new Set(), restrictedItems: new Set(),
             abilityCombos: new Set(),       // "-Regenerator + Wimp Out": can't have both
             ruleset: [],                    // the format's own rules, in order ("!Obtainable Abilities"...)
         };
@@ -702,8 +720,8 @@
                 formeOnly = true; // bans just the base forme, not the whole species
             }
             if (!sp?.exists) {
-                const ab = Dex.abilities.get(token);
-                if (ab?.exists) bans.abilities.add(ab.id);
+                const hit = classifyRuleToken(token);
+                if (hit) bans[hit.kind].add(hit.id);
                 sawNonSpeciesBan = true;
                 continue;
             }
@@ -727,8 +745,8 @@
         for (const token of sections.Restricted || []) {
             const sp = Dex.species.get(token);
             if (!sp?.exists) {
-                const ability = Dex.abilities.get(token);
-                if (ability?.exists) bans.restrictedAbilities.add(ability.id);
+                const hit = classifyRuleToken(token);
+                if (hit) bans[RESTRICTED_KEY[hit.kind]].add(hit.id);
                 continue;
             }
 
@@ -809,13 +827,13 @@
             }
 
             if (!sp?.exists) {
-                const ability = Dex.abilities.get(token);
-                if (ability?.exists) {
-                    if (sign === '-') bans.abilities.add(ability.id);
-                    else if (sign === '+') bans.abilities.delete(ability.id);
-                    else bans.restrictedAbilities.add(ability.id);
+                const hit = classifyRuleToken(token);
+                if (hit) {
+                    if (sign === '-') bans[hit.kind].add(hit.id);
+                    else if (sign === '+') bans[hit.kind].delete(hit.id);
+                    else bans[RESTRICTED_KEY[hit.kind]].add(hit.id);
                 }
-                continue; // items / moves: nothing to apply to the Pokémon list
+                continue;
             }
 
             const whole = !formeOnly && bansWholeSpecies(token, sp);
@@ -935,6 +953,7 @@
             unbanned: new Set(), unbannedBase: new Set(), abilities: new Set(),
             restricted: new Set(), restrictedBase: new Set(), restrictedAbilities: new Set(),
             abilityCombos: new Set(), ruleset: [],
+            moves: new Set(), items: new Set(), restrictedMoves: new Set(), restrictedItems: new Set(),
         };
     }
 
@@ -1126,9 +1145,13 @@
 
             // The base legal pool must come from Gen 9, not TSA's stale format data.
             const savedFormat = this.format;
-            this.format = 'gen9';
-            const gen9Results = original.call(this);
-            this.format = savedFormat;
+            this.format = 'customgame'; // PS has already stripped the generation prefix.
+            let gen9Results;
+            try {
+                gen9Results = original.call(this);
+            } finally {
+                this.format = savedFormat;
+            }
 
             return gen9Results.filter((result) => {
                 if (result[0] !== this.searchType) return true;
@@ -2140,6 +2163,11 @@
         if (original.call(ctx, row, [['move', moveId]])) return true;
         const mods = modsForSearch(ctx);
         if (mods.includes(MOD.ALL_MOVES)) return getAlphabetCupCache(ctx.dex).ids.has(toID(moveId));
+        if (mods.includes(MOD.TYPEMONS) && ctx.__qolTypemons &&
+            getAlphabetCupCache(ctx.dex).ids.has(toID(moveId)) &&
+            ctx.dex.moves.get(moveId).type === ctx.__qolTypemons) {
+            return true;
+        }
         return mods.includes(MOD.ALPHABET_CUP) && alphabetCupCanLearn(ctx.dex, species, moveId);
     }
 
@@ -2186,6 +2214,53 @@
 
         const extras = [...getAlphabetCupCache(search.dex).ids].filter((id) => !legalPool.has(id));
         return extras.length ? addMovesToResults(search, results, species, extras) : results;
+    }
+
+    // Typemons: one shared non-native move type for the team.
+    function typemonsIllegalTypes(room, search) {
+        const dex = room?.curTeam?.dex;
+        const team = room?.curSetList;
+        const engine = room?.search?.engine;
+        const probe = search || engine?.moveSearch || engine?.typedSearch;
+        if (!dex || !Array.isArray(team) || typeof probe?.canLearn !== 'function') return [];
+        const bans = getMergedBans(room);
+        const types = [];
+        for (const set of team) {
+            const species = set?.species && dex.species.get(set.species);
+            if (!species?.exists) continue;
+            for (const name of set.moves || []) {
+                const move = name && dex.moves.get(name);
+                if (!move?.exists) continue;
+                if (bans?.moves?.has(move.id) || bans?.restrictedMoves?.has(move.id)) continue;
+                let native = true;
+                try { native = !!probe.canLearn(species.id, move.id); } catch (e) { /* assume legal */ }
+                if (!native) types.push(move.type);
+            }
+        }
+        return types;
+    }
+
+    function typemonsType(room = getActiveTeambuilderRoom(), search = null) {
+        const team = room?.curTeam;
+        if (!team) return null;
+        const types = typemonsIllegalTypes(room, search);
+        if (team.__qolTypemons && types.includes(team.__qolTypemons)) return team.__qolTypemons;
+        return (team.__qolTypemons = types[0] || null);
+    }
+
+    function typemonsMoveResults(search, base) {
+        const results = base();
+        if (!search.species) return results;
+        const species = search.dex.species.get(search.species);
+        if (!species?.exists) return results;
+        // No type locked yet: every Pokémon keeps only its native movepool.
+        const type = typemonsType(getActiveTeambuilderRoom(), search);
+        if (!type) return results;
+
+        const have = new Set(results.filter((r) => r[0] === 'move').map((r) => r[1]));
+        const add = [...getAlphabetCupCache(search.dex).ids].filter((id) =>
+                                                                    !have.has(id) && search.dex.moves.get(id).type === type);
+        return add.length ? addMovesToResults(search, results, species, add) : results;
     }
 
     // ---------- National Dex movepool (move-search "natdex" chip) ----------
@@ -2429,25 +2504,117 @@
         ];
     }
 
-    // Every format: abilities the format bans go under one "Banned Abilities" header at the bottom.
-    function moveBannedAbilitiesToHeader(search, results) {
-        if (!Array.isArray(results) || results.some((r) => r[0] === 'header' && r[1] === 'Banned Abilities')) return results;
+    // Pull rows matching a predicate out of their sections and place them under a dedicated header.
+    function groupUnderHeader(results, header, test) {
+        if (results.some((r) => r[0] === 'header' && r[1] === header)) return results;
+        const hit = [];
+        const kept = results.filter((r) => (test(r) ? (hit.push(r), false) : true));
+        return hit.length ? [...dropEmptyHeaders(kept), ['header', header], ...hit] : results;
+    }
 
+        // Re-applies the Banned / Restricted groups to any result list (also flat search / sort lists).
+    function applyGroups(results, groups) {
+        let out = results;
+        for (const g of groups || []) {
+            out = groupUnderHeader(out, g.header, (r) => r[0] === g.kind && g.test(r[1]));
+        }
+        return out;
+    }
+
+    // Runs after every engine find(), so the headers survive typing, sorting and filter chips.
+    function patchEngineFindBanHeaders() {
+        return patchEngineMethod('find', '__qolBanHeadersPatched', (original) =>
+            function (...args) {
+                const changed = original.apply(this, args);
+                try {
+                    const groups = this.typedSearch?.__qolGroups;
+                    if (groups?.length && Array.isArray(this.results)) {
+                        const out = applyGroups(this.results, groups);
+                        if (out !== this.results) {
+                            this.results = out;
+                            if (typeof this.getFirstResultIndex === 'function') this.selection = this.getFirstResultIndex();
+                        }
+                    }
+                } catch (e) {
+                    console.error(LOG, 'Ban header regroup failed:', e);
+                }
+                return changed;
+            }
+        );
+    }
+
+        function moveBannedAbilitiesToHeader(search, results) {
+        search.__qolGroups = null;
+        if (!Array.isArray(results)) return results;
         const format = getActiveTeambuilderRoom()?.curTeam?.format || search.format;
         const bans = getMergedBansForFormat(format);
-        if (!bans?.abilities.size && !bans?.abilityCombos?.size) return results;
+        if (!bans?.abilities.size && !bans?.abilityCombos?.size && !bans?.restrictedAbilities?.size) return results;
 
         const species = search.species ? search.dex.species.get(search.species) : null;
         const nativeIds = [...new Set(Object.values(species?.abilities || {}).map((n) => toID(n)).filter(Boolean))];
         const pokebilities = isPokebilitiesFormat(format);
 
-        const banned = [];
-        const kept = results.filter((r) => {
-            if (r[0] !== 'ability' || !abilityBanned(bans, r[1], nativeIds, pokebilities)) return true;
-            banned.push(r);
-            return false;
+        const banned = (id) => abilityBanned(bans, id, nativeIds, pokebilities);
+        const restricted = (id) => !banned(id) && !!bans.restrictedAbilities?.has(id) && !nativeIds.includes(id);
+
+        search.__qolGroups = [
+            {header: 'Restricted Abilities', kind: 'ability', test: restricted},
+            {header: 'Banned Abilities', kind: 'ability', test: banned},
+        ];
+        return applyGroups(results, search.__qolGroups);
+    }
+
+    function moveBannedAbilitiesToHeader(search, results) {
+        if (!Array.isArray(results)) return results;
+        const format = getActiveTeambuilderRoom()?.curTeam?.format || search.format;
+        const bans = getMergedBansForFormat(format);
+        if (!bans?.abilities.size && !bans?.abilityCombos?.size && !bans?.restrictedAbilities?.size) return results;
+
+        const species = search.species ? search.dex.species.get(search.species) : null;
+        const nativeIds = [...new Set(Object.values(species?.abilities || {}).map((n) => toID(n)).filter(Boolean))];
+        const pokebilities = isPokebilitiesFormat(format);
+        const banned = (r) => r[0] === 'ability' && abilityBanned(bans, r[1], nativeIds, pokebilities);
+        const restricted = (r) => r[0] === 'ability' && !banned(r) &&
+            !!bans.restrictedAbilities?.has(r[1]) && !nativeIds.includes(r[1]);
+        return groupUnderHeader(groupUnderHeader(results, 'Restricted Abilities', restricted), 'Banned Abilities', banned);
+    }
+
+    function moveBannedMovesToHeader(search, results, nativeRows) {
+        search.__qolGroups = null;
+        if (!Array.isArray(results)) return results;
+        const bans = getMergedBansForFormat(getActiveTeambuilderRoom()?.curTeam?.format || search.format);
+        if (!bans?.moves?.size && !bans?.restrictedMoves?.size) return results;
+
+        const native = bans.restrictedMoves?.size
+            ? new Set(nativeRows().filter((r) => r[0] === 'move').map((r) => r[1]))
+            : new Set();
+        const banned = (id) => !!bans.moves?.has(id);
+        const restricted = (id) => !banned(id) && !!bans.restrictedMoves?.has(id) && !native.has(id);
+
+        search.__qolGroups = [
+            {header: 'Restricted Moves', kind: 'move', test: restricted},
+            {header: 'Banned Moves', kind: 'move', test: banned},
+        ];
+        return applyGroups(results, search.__qolGroups);
+    }
+
+    function patchItemSearchBans() {
+        return patchMethod(window.BattleItemSearch?.prototype, 'getBaseResults', '__qolItemBansPatched', (original) =>
+                           function (...args) {
+            const results = original.apply(this, args);
+            this.__qolGroups = null;
+            if (!Array.isArray(results)) return results;
+            const bans = getMergedBansForFormat(getActiveTeambuilderRoom()?.curTeam?.format || this.format);
+            if (!bans) return results;
+
+            const bannedItem = (id) => !!bans.items?.has(id);
+            this.__qolGroups = [
+                {header: 'Restricted Items', kind: 'item', test: (id) => !bannedItem(id) && !!bans.restrictedItems?.has(id)},
+                {header: 'Banned Moves', kind: 'move', test: (id) => !!bans.moves?.has(id)},
+                {header: 'Banned Items', kind: 'item', test: bannedItem},
+            ];
+            return applyGroups(results, this.__qolGroups);
         });
-        return banned.length ? [...dropEmptyHeaders(kept), ['header', 'Banned Abilities'], ...banned] : results;
     }
 
     // ---------- Frantic Fusions / Inheritance ability list ----------
@@ -2573,6 +2740,7 @@
         [MOD.ALPHABET_CUP]: alphabetCupMoveResults,
         [MOD.ALL_MOVES]: camoveMoveResults,
         [MOD.SKETCHMONS]: sketchmonsMoveResults,
+        [MOD.TYPEMONS]: typemonsMoveResults,
     };
 
     function runProviderChain(providers, search, nativeBase) {
@@ -2603,7 +2771,8 @@
     function patchMoveSearchResults() {
         return patchMethod(window.BattleMoveSearch?.prototype, 'getBaseResults', '__qolMoveProvidersPatched', (original) =>
                            function () {
-            return runProviderChain(MOVE_PROVIDERS, this, () => augmentWithNatdexMoves(this, original.call(this)));
+            const nativeRows = () => augmentWithNatdexMoves(this, original.call(this));
+            return moveBannedMovesToHeader(this, runProviderChain(MOVE_PROVIDERS, this, nativeRows), nativeRows);
         }
                           );
     }
@@ -2613,11 +2782,14 @@
     // Move/ability results are cached per search instance. Bust the cache when
     // the nickname (the cross-evo / fusion donor) changes.
     function bustFusionCache(search) {
-        if (!modsForSearch(search).some(isFusionMod) || !search.set) return;
-
-        const key = [search.set.species || '', search.set.name || '', search.species || ''].join('|');
+        if (!search.set) return;
+        const mods = modsForSearch(search);
+        const parts = [];
+        if (mods.some(isFusionMod)) parts.push(search.set.species || '', search.set.name || '', search.species || '');
+        if (mods.includes(MOD.TYPEMONS)) parts.push('typemons', typemonsType(getActiveTeambuilderRoom(), search) || '');
+        if (!parts.length) return;
+        const key = parts.join('|');
         if (search.__qolFusionKey === key) return;
-
         search.__qolFusionKey = key;
         clearSearchCache(search);
     }
@@ -2664,14 +2836,15 @@
     const baseFilterType = (type) => (isNegatedFilterType(type) ? type.slice(1) : type);
 
     const ALLOWED_POKEMON_FILTER_TYPES = [
-        'type', 'move', 'ability', 'egggroup', 'tier', 'weak', 'resists', 'neutral',
-        'natdex', 'fe', 'recovery', 'pivot', 'priority', 'removal', 'hazards', 'into', 'from',
+        'type', 'color', 'move', 'ability', 'egggroup', 'tier', 'weak', 'resists', 'neutral',
+        'natdex', 'hackmons', 'fe', 'recovery', 'pivot', 'priority', 'removal', 'hazards', 'into', 'from',
         'legendary', 'boxlegend', 'mythical', 'paradox', 'eeveelution', 'restricted', 'realbulk',
     ];
     // Toggle filters take no argument: typing the keyword and picking the
     // single suggestion adds/removes the chip. Value = display label.
     const CUSTOM_TOGGLE_FILTERS = {
         natdex: 'National Dex',
+        hackmons: 'Hackmons',
         fe: 'Fully Evolved',
         recovery: 'Recovery',
         pivot: 'Pivot',
@@ -2682,7 +2855,6 @@
         mythical: 'Mythical',
         paradox: 'Paradox',
         eeveelution: 'Eeveelution',
-        removal: 'Removal',
         hazards: 'Hazards',
         restricted: 'Restricted',
         realbulk: 'Real Bulk',
@@ -2691,6 +2863,21 @@
 
     // Namespaced pseudo-ids so suggestion rows can't collide with real ids.
     const CUSTOM_TOGGLE_PREFIX = 'is ';
+
+    const POKEMON_COLORS = ['Black', 'Blue', 'Brown', 'Gray', 'Green', 'Pink', 'Purple', 'Red', 'White', 'Yellow'];
+    const COLOR_ROW_PREFIX = 'color ';
+    const pokemonColorName = (value) => POKEMON_COLORS.find((color) =>
+        toSearchId(color) === toSearchId(value).replace(/^grey$/, 'gray')) || null;
+    const colorRowName = (id) => typeof id === 'string' && id.startsWith(COLOR_ROW_PREFIX)
+        ? pokemonColorName(id.slice(COLOR_ROW_PREFIX.length)) : null;
+
+    function colorSuggestions(query) {
+        const q = toSearchId(query).replace(/grey/g, 'gray');
+        return POKEMON_COLORS.filter((color) => {
+            const id = toSearchId(color);
+            return !q || [id, 'color' + id, 'colour' + id].some((name) => name.startsWith(q));
+        }).map((color) => ['ability', COLOR_ROW_PREFIX + toSearchId(color), 0, 0]);
+    }
     const INTO_PREFIX = 'Into ';
     const FROM_PREFIX = 'From ';
 
@@ -2871,7 +3058,7 @@
             toggleMoveMatchCache.set(ctx, cache);
         }
 
-        const key = kind + '|' + species.id;
+        const key = kind + '|' + species.id + '|' + (ctx.__qolTypemons || '');
         if (cache.map.has(key)) return cache.map.get(key);
 
         const result = getCustomToggleMoveIds(ctx.dex, kind)
@@ -2925,7 +3112,7 @@
                     'ability',
                     CUSTOM_TOGGLE_PREFIX + key,
                     0,
-                    Math.min(String(query || '').length, label.length),
+                    prefixMatchEnd(label, query),
                 ]);
             }
         }
@@ -2934,6 +3121,7 @@
 
     // Mirrors DexSearch#addFilter's per-type normalization.
     function normalizePokemonFilterValue(engine, type, value) {
+        if (type === 'color') return pokemonColorName(value);
         if (type === 'type' || type === 'weak' || type === 'resists') return engine.capitalizeFirst(value);
         if (type === 'move') return toID(value);
         if (type === 'ability') return engine.dex.abilities.get(value).name;
@@ -2976,6 +3164,7 @@
             return pushPokemonFilter(engine, type, target, negated);
         }
         if (!ALLOWED_POKEMON_FILTER_TYPES.includes(type)) return false;
+        if (type === 'color' && !pokemonColorName(value)) return false;
 
         return pushPokemonFilter(engine, type, normalizePokemonFilterValue(engine, type, value), negated);
     }
@@ -3027,6 +3216,8 @@
 
     // Does `species` satisfy one (non-negated) filter?
     function pokemonFilterMatches(search, original, row, species, type, target) {
+        if (type === 'color') return pokemonColorName(species.color) === pokemonColorName(target);
+        if (type === 'natdex' || type === 'hackmons') return pokemonFormatPool(search, type).ids.has(species.id);
         if (EFFECT_LABELS[type]) return pokemonMatchesEffectiveness(search.dex, species, type, target);
         if (type === 'into') return !!crossEvolveView(search.dex, species, target);
         if (type === 'from') return !!crossEvolveView(search.dex, search.dex.species.get(target), species.id);
@@ -3056,8 +3247,8 @@
                 const negated = isNegatedFilterType(rawType);
                 const type = baseFilterType(rawType);
 
-                // natdex only widens the pool; stone only changes how rows are judged/shown.
-                if (type === 'natdex' || type === 'stone' || type === 'realbulk') continue;
+                // Pool chips are membership filters, including their negated forms.
+                if (type === 'stone' || type === 'realbulk') continue;
 
                 let matches;
                 if (view && type === 'type') {
@@ -3076,7 +3267,7 @@
     }
 
     // ---------- Pokémon search results: one getResults wrapper ----------
-    //   before: remember into/from chips, widen pool for "natdex"
+    //   before: remember into/from chips, select the native format pool
     //   after:  apply server banlist, then Godly Gift legality
 
     // Moves rows matching `isBanned` into the "Illegal results" section (created if the
@@ -3108,23 +3299,17 @@
         );
     }
 
-    // The client's species.tier is the regular (non-National Dex) tier, but its National Dex search
-    // list is already grouped by National Dex tier ("Uber", "OU", ...). Read the tier off the section
-    // header each Pokémon sits under, so "ND Uber" bans can be judged. Cached per base-results list.
+    // Read tiers through PS itself: headers omit banned species and can say
+    // "OU by technicality", which is not a tier id.
     function natdexTierMap(search) {
-        const base = search.baseResults;
-        if (!Array.isArray(base)) return null;
-        if (search.__qolTierMap && search.__qolTierMapFor === base) return search.__qolTierMap;
-
+        if (!search?.dex) return null;
+        const pool = pokemonFormatPool(search, 'natdex');
+        if (pool.tiers) return pool.tiers;
         const map = new Map();
-        let tier = '';
-        for (const row of base) {
-            if (row[0] === 'header') tier = toID(String(row[1])); // "(Uber)" -> 'uber'
-            else if (row[0] === 'pokemon') map.set(row[1], tier);
+        for (const id of Object.keys(window.BattlePokedex || {})) {
+            map.set(id, toID(pool.search.getTier(pool.search.dex.species.get(id))));
         }
-        search.__qolTierMap = map;
-        search.__qolTierMapFor = base;
-        return map;
+        return (pool.tiers = map);
     }
 
     function formatSpeciesTier(search, species) {
@@ -3133,7 +3318,7 @@
         return toID(formatSpecies?.exists ? formatSpecies.tier : species.tier);
     }
 
-    function applyGenericBans(search, results, hasNatdex) {
+    function applyGenericBans(search, results) {
         const banFormat =
               getActiveTeambuilderRoom()?.curTeam?.format || search.format;
         const bans = getMergedBansForFormat(banFormat); // base list + the team's custom rules
@@ -3174,22 +3359,41 @@
         const isIllegal = room && getGodlyGiftIllegalChecker(room);
         if (!isIllegal) return results;
 
-        const legal = [];
-        const illegal = [];
+        return moveBannedToIllegal(search, results, isIllegal, () => 'Only one restricted Pokémon is allowed');
+    }
 
-        for (const row of results) {
-            if (row[0] !== 'pokemon') {
-                legal.push(row);
-                continue;
-            }
-            (isIllegal(search.dex.species.get(row[1])) ? illegal : legal).push(row);
+    // Build a separate native search so PS initializes formatType and generation
+    // correctly without changing the team's format or the live search's Dex.
+    const pokemonFormatPoolCache = new WeakMap();
+    function pokemonFormatPool(search, kind) {
+        const gen = search.dex.gen;
+        const hasNatdexTable = !!window.BattleTeambuilderTable?.[`gen${gen}natdex`];
+        // This chip selects a dex, not the National Dex OU banlist. AG includes
+        // every standard tier; the team's actual format bans still apply later.
+        const format = `gen${gen}${kind === 'natdex'
+            ? (hasNatdexTable ? 'nationaldexag' : 'anythinggoes') : 'purehackmons'}`;
+        let cache = pokemonFormatPoolCache.get(search);
+        if (!cache || cache.dex !== search.dex || cache.table !== window.BattleTeambuilderTable) {
+            cache = {dex: search.dex, table: window.BattleTeambuilderTable, pools: new Map()};
+            pokemonFormatPoolCache.set(search, cache);
         }
-
-        if (!illegal.length) return results;
-        return legal.concat([['header', TL(['Illegal results'])], ...illegal]);
+        if (!cache.pools.has(format)) {
+            const native = new window.BattlePokemonSearch('pokemon', format);
+            const rows = native.getBaseResults();
+            cache.pools.set(format, {
+                search: native, rows,
+                ids: new Set(rows.filter((row) => row[0] === 'pokemon').map((row) => row[1])),
+            });
+        }
+        return cache.pools.get(format);
     }
 
     function patchPokemonSearchResults() {
+        patchMethod(window.BattlePokemonSearch?.prototype, 'getTier', '__qolPoolTierPatched', (original) =>
+            function (species) {
+                return this.__qolPokemonPool
+                    ? this.__qolPokemonPool.search.getTier(species) : original.call(this, species);
+            });
         return patchMethod(window.BattlePokemonSearch?.prototype, 'getResults', '__qolPokemonResultsPatched', (original) =>
                            function (filters, sortCol, reverseSort) {
             if (this.searchType !== 'pokemon') return original.call(this, filters, sortCol, reverseSort);
@@ -3203,34 +3407,39 @@
             this.__qolFromId = findChip('from');
             this.__qolStoneId = findChip('stone');
             this.__qolRealBulk = Array.isArray(filters) && filters.some((f) => f[0] === 'realbulk');
+            this.__qolTypemons = modsForSearch(this).includes(MOD.TYPEMONS)
+                ? typemonsType(getActiveTeambuilderRoom(), this) : null;
 
-            // "natdex" chip: use the complete Pokédex as the legal pool
-            // (includes mons the format normally considers illegal).
-            const hasNatdex =
-                  Array.isArray(filters) && filters.some(([rawType]) => baseFilterType(rawType) === 'natdex');
+            // Positive chips select a native base pool; all pool chips then AND
+            // together as membership filters. Negative chips never widen the pool.
+            const poolKind = ['natdex', 'hackmons'].find((kind) =>
+                Array.isArray(filters) && filters.some(([type]) => type === kind)) || null;
+            const pool = poolKind ? pokemonFormatPool(this, poolKind) : null;
+            if (this.__qolPokemonPool !== pool) {
+                clearSearchCache(this);
+                this.__qolPokemonPool = pool;
+            }
+            if (pool && !this.baseResults) this.baseResults = pool.rows;
 
-            if (hasNatdex) {
-                this.baseResults = this.getDefaultResults();
-                this.baseIllegalResults = [];
-                this.illegalReasons = {};
-                this.__qolNatdexPoolActive = true;
-            } else if (this.__qolNatdexPoolActive) {
-                // Filter removed: drop the widened cache so real legality is rebuilt.
-                this.__qolNatdexPoolActive = false;
-                this.baseResults = null;
-                this.baseIllegalResults = null;
-                this.illegalReasons = null;
+            // Dynamic bans must not stick after a team/rule change. Keep the
+            // client's native reasons separately from reasons added below.
+            if (this.baseIllegalResults && this.__qolIllegalPool === this.baseIllegalResults) {
+                this.illegalReasons = {...this.__qolNativeIllegalReasons};
             }
 
             let results = original.call(this, filters, sortCol, reverseSort);
             if (!Array.isArray(results)) return results;
+            if (this.__qolIllegalPool !== this.baseIllegalResults) {
+                this.__qolIllegalPool = this.baseIllegalResults;
+                this.__qolNativeIllegalReasons = {...this.illegalReasons};
+            }
             if (isMnmSearch(this)) {
                 results = dropEmptyHeaders(results.filter(
                     (r) => r[0] !== 'pokemon' || !requiresHeldItem(this.dex.species.get(r[1]))
                 ));
             }
 
-            results = applyGenericBans(this, results, hasNatdex);
+            results = applyGenericBans(this, results);
             return applyGodlyGiftLegality(this, results);
         }
                           );
@@ -3776,7 +3985,7 @@
         scored.sort((a, b) => a.score - b.score); // stable: exact matches first
         return scored
             .slice(0, q ? 12 : Infinity)
-            .map((s) => ['ability', MOVE_ROW_PREFIX + s.key, 0, 0]);
+            .map((s) => ['ability', MOVE_ROW_PREFIX + s.key, 0, prefixMatchEnd(MOVE_TOGGLES[s.key].label, query)]);
     }
 
     // Parses a pseudo row id (case-insensitive) into everything needed to
@@ -3808,6 +4017,7 @@
             type: MOVE_FILTER_TYPE + key,
             value: def.label,
             label: def.label,
+            desc: def.desc,
             descHtml: BattleLog.escapeHTML(def.desc),
         };
     }
@@ -4016,6 +4226,17 @@
     }
 
     function pokemonTextSearch(engine, original, query) {
+        const poolFilters = (engine.filters || []).filter(([type]) =>
+            ['natdex', 'hackmons'].includes(baseFilterType(type)));
+        const searchFilters = (engine.filters || []).filter(([type]) =>
+            ['natdex', 'hackmons', 'color'].includes(baseFilterType(type)));
+        // Native textSearch bypasses getResults/filter. Keep pool membership
+        // and legality in sync while typing as well as in the blank-query list.
+        if (poolFilters.length || engine.typedSearch?.__qolPokemonPool) {
+            engine.typedSearch.getResults(engine.filters, null, false);
+        }
+        const nativeSearch = (text) => dropEmptyHeaders((original.call(engine, text) || []).filter((row) =>
+            row[0] !== 'pokemon' || !searchFilters.length || engine.typedSearch.filter(row, searchFilters)));
         const raw = String(query || '').trim();
         const negated = raw.startsWith('!');
         const q = (negated ? raw.slice(1) : raw).trim().toLowerCase();
@@ -4030,8 +4251,8 @@
                 // Drop native suggestions colliding with our keywords (e.g. the
                 // real "natdex" tier), then put ours first so they're the
                 // default (Enter) selection.
-                const native = (original.call(engine, query) || []).filter((row) => !isReservedToggleCollisionRow(row));
-                const custom = customToggleSuggestions(raw);
+                const native = nativeSearch(query).filter((row) => !isReservedToggleCollisionRow(row));
+                const custom = customToggleSuggestions(raw).concat(colorSuggestions(raw));
                 const stones = stoneSuggestions(engine, raw);
 
                 if (!custom.length && !stones.length) return native;
@@ -4041,8 +4262,6 @@
                 if (stones.length) head.push(['header', 'Mega Stones'], ...stones);
                 return (engine.results = head.concat(native));
 
-                if (!custom.length) return native;
-                return (engine.results = [['header', 'Mod Filters'], ...custom].concat(native));
             }
 
             engine.__qolNegateMode = true;
@@ -4051,7 +4270,7 @@
             if (!q) {
                 // Bare "!": every toggle plus every type. Abilities/moves only
                 // show once you type their name (too many to list).
-                results = [['header', 'Not'], ...customToggleSuggestions('', true)];
+                results = [['header', 'Not'], ...customToggleSuggestions('', true), ...colorSuggestions('')];
                 for (const typeName of Object.keys(window.BattleTypeChart || {})) {
                     results.push(['type', toSearchId(typeName), 0, typeName.length]);
                 }
@@ -4064,7 +4283,7 @@
                     (rowType === 'type' || rowType === 'ability' || rowType === 'move' || rowType === 'tier') &&
                     !Object.prototype.hasOwnProperty.call(CUSTOM_TOGGLE_FILTERS, toSearchId(rowId))
                 );
-                results = customToggleSuggestions(q, true).concat(suggestions);
+                results = customToggleSuggestions(q, true).concat(colorSuggestions(q), suggestions);
             }
 
             engine.results = results;
@@ -4098,6 +4317,11 @@
     function pokemonAddFilter(engine, original, entry) {
         const rawValue = entry?.[1];
         const isStr = typeof rawValue === 'string';
+        const color = colorRowName(rawValue);
+        if (color) {
+            return addPokemonSearchFilter(engine, 'color', color,
+                isNegatedFilterType(entry[0]) || engine.__qolNegateMode);
+        }
 
         // "Into X" suggestion picked (only one "into" chip at a time).
         if (isStr && rawValue.startsWith(INTO_PREFIX)) {
@@ -4150,7 +4374,7 @@
         }
 
         // Directly supplied positive custom filters (e.g. from the console).
-        if (EFFECT_LABELS[rawType] || CUSTOM_TOGGLE_FILTERS[rawType]) {
+        if (rawType === 'color' || EFFECT_LABELS[rawType] || CUSTOM_TOGGLE_FILTERS[rawType]) {
             return addPokemonSearchFilter(engine, rawType, entry[1], false);
         }
 
@@ -4159,6 +4383,8 @@
 
     function pokemonResultName(engine, original, result) {
         const id = typeof result?.[1] === 'string' ? result[1] : '';
+        const color = colorRowName(id);
+        if (color) return `${engine.__qolNegateMode ? 'Not ' : ''}${color}`;
 
         if (id.startsWith(INTO_PREFIX)) {
             const sp = engine.dex.species.get(id.slice(INTO_PREFIX.length));
@@ -4224,8 +4450,8 @@
                 const mods = modsForSearch(this);
                 const tmp = {...(this.set || room?.curSet || {}), species, item: item.id};
                 const stats = isMnmStoneItem(this.dex, item)
-                    ? computeModsBaseStats(mods, {dex: this.dex, set: tmp, room})
-                    : null;
+                ? computeModsBaseStats(mods, {dex: this.dex, set: tmp, room})
+                : null;
                 if (!stats) { otherRows.push({row}); continue; }
                 stoneRows.push({
                     row, stats,
@@ -4477,6 +4703,7 @@
 
         patchEngineSelectResult();
         patchEngineSetType();
+        patchEngineFindBanHeaders();
 
         return Object.keys(ENGINE_SEARCH_HANDLERS.pokemon).map((key) =>
                                                                patchEngineMethod(key, '__qolDispatch_' + key, (original) =>
@@ -4634,11 +4861,6 @@
                 }
             }
 
-            const filters = this.engine?.typedSearch?.filters ?? [];
-            if (filters.some((f) => Array.isArray(f) && f[0] === 'natdex')) {
-                return finish(call(pokemon, undefined));
-            }
-
             const mods = getActiveMods();
             if (!pokemon || !hasSearchListStats(mods)) return finish(call(pokemon, errorMessage));
 
@@ -4651,16 +4873,53 @@
     // through a real, harmless ability id to inherit the native markup, then
     // the visible name is swapped for our label. Native type/ability/move/tier
     // rows get "Weak " / "!" prefixes while an effectiveness / negate mode is active.
+
+    const FILTER_TAG_HTML = '<span class="col filtercol"><em>Filter</em></span>';
+
+    // Length of the label prefix the query matches (0 if it matched an alias / key instead).
+    function prefixMatchEnd(label, query) {
+        const q = toSearchId(query);
+        if (!q || !toSearchId(label).startsWith(q)) return 0;
+        let seen = 0;
+        for (let i = 0; i < label.length; i++) {
+            if (/[a-z0-9]/i.test(label[i]) && ++seen === q.length) return i + 1;
+        }
+        return 0;
+    }
+
+    // `prefix` ("Not ", "!") is shown but never highlighted.
+    function highlightedLabel(label, start, end, prefix = '') {
+        const esc = BattleLog.escapeHTML;
+        const s = Math.max(0, Math.min(label.length, Number(start) || 0));
+        const e = Math.max(s, Math.min(label.length, Number(end) || 0));
+        return esc(prefix) + (e > s
+                              ? esc(label.slice(0, s)) + '<b>' + esc(label.slice(s, e)) + '</b>' + esc(label.slice(e))
+                              : esc(label));
+    }
+
     function patchSearchRowText() {
         return patchMethod(window.BattleSearch?.prototype, 'renderRow', '__qolEffectivenessTypeNamePatched', (original) =>
                            function (row, type, matchStart, matchEnd, errorMessage, attrs) {
             if (type === 'sortitem') return renderItemSortRow(this);
-            const renderLabelRow = (text) =>
+            const renderLabelRow = (label, prefix = '') =>
             original.call(this, ['ability', 'noability'], 'ability', matchStart, matchEnd, errorMessage, attrs)
-            .replace(/(<span class="col namecol"><b>)([^<]*)(<\/b>)/, `$1${text}$3`);
+            .replace(/<span class="col namecol">[\s\S]*?<\/span>/, () =>
+                     `<span class="col namecol qol-pkf qol-mvf">${highlightedLabel(label, matchStart, matchEnd, prefix)}</span>`)
+            .replace(/<span class="col abilitydesccol">[\s\S]*?<\/span>/, () => FILTER_TAG_HTML);
 
             const id = type === 'ability' && typeof row?.[1] === 'string' ? row[1] : '';
             const dex = this.engine?.dex;
+            const color = colorRowName(id);
+            if (color) return renderLabelRow(`${color}`, this.engine?.__qolNegateMode ? 'Not ' : '');
+
+            if (id.toLowerCase().startsWith(MOVE_ROW_PREFIX)) {
+                const info = moveFilterRowInfo(id);
+                if (info) {
+                    let html = renderLabelRow(info.label, this.engine?.__qolMoveNegate ? '!' : '');
+                    if (info.descHtml) html = html.replace('<span class="col namecol', `<span title="${BattleLog.escapeHTML(info.descHtml)}" class="col namecol`);
+                    return info.iconsHtml ? html.replace(FILTER_TAG_HTML, info.iconsHtml + FILTER_TAG_HTML) : html;
+                }
+            }
 
             if (id.startsWith(INTO_PREFIX)) {
                 const sp = dex?.species?.get(id.slice(INTO_PREFIX.length));
@@ -4679,7 +4938,7 @@
 
             if (id.startsWith(CUSTOM_TOGGLE_PREFIX)) {
                 const label = CUSTOM_TOGGLE_FILTERS[id.slice(CUSTOM_TOGGLE_PREFIX.length)];
-                if (label) return renderLabelRow(this.engine?.__qolNegateMode ? `Not ${label}` : label);
+                if (label) return renderLabelRow(label, this.engine?.__qolNegateMode ? 'Not ' : '');
             }
 
             const html = original.call(this, row, type, matchStart, matchEnd, errorMessage, attrs);
@@ -4726,6 +4985,8 @@
 
                 if (EFFECT_LABELS[kind]) {
                     text = EFFECT_LABELS[kind] + ' ' + text.charAt(0).toUpperCase() + text.slice(1);
+                } else if (kind === 'color') {
+                    text = text;
                 } else if (kind === 'from') {
                     text = Dex.species.get(text).name + ' Into';
                 }else if (kind === 'stone') {
@@ -4743,7 +5004,6 @@
                 return '<button class="filter" value="' + BattleLog.escapeHTML(filter.join(':')) + '">' +
                     text + ' <i class="fa fa-times-circle"></i></button> ';
             });
-
 
             return '<p>Filters: ' + buttons.join('') +
                 (q ? '' : '<small style="color: #888">(backspace = delete filter)</small>') + '</p>';
@@ -4790,6 +5050,27 @@
     // ====================================================================
 
     // Stat calculation for every mod.
+    // Like native Monotype, seed a removable chip only when adding a new slot.
+    // Searching or removing the chip must never silently reapply it.
+    function patchMonocolorAddPokemon() {
+        return patchMethod(window.TeambuilderRoom?.prototype, 'addPokemon', '__qolMonocolorPatched', (original) =>
+            function (...args) {
+                const result = original.apply(this, args);
+                const format = String(this.curTeam?.format || '').split('@@@')[0];
+                if (!fmtHas(format, 'monocolor', 'monocolour') || this.curSet?.species) return result;
+                const engine = this.search?.engine;
+                if (engine?.typedSearch?.searchType !== 'pokemon') return result;
+                const dex = this.curTeam.dex;
+                const first = this.curSetList?.find((set) => set.species && dex.species.get(set.species)?.exists);
+                const color = first && pokemonColorName(dex.species.get(first.species).color);
+                if (color && addPokemonSearchFilter(engine, 'color', color, false)) {
+                    this.search.filters = engine.filters;
+                    this.search.find('');
+                }
+                return result;
+            });
+    }
+
     function patchGetStat() {
         return patchMethod(window.TeambuilderRoom?.prototype, 'getStat', '__qolPatched', (original) =>
                            function (stat, set, evOverride, natureOverride) {
@@ -5298,15 +5579,17 @@
             const entry = a.getAttribute('data-entry') || '';
 
             if (entry.startsWith('ability|') && entry.slice(8).toLowerCase().startsWith(MOVE_ROW_PREFIX)) {
-                if (a.querySelector('.qol-mvf')) continue;
+                if (a.querySelector('.qol-done')) continue;
                 const info = moveFilterRowInfo(entry.slice(8));
                 if (!info) continue;
 
-                a.innerHTML =
-                    `<span class="col namecol qol-mvf">${bang}${info.label}</span> ` +
-                    (info.iconsHtml
-                     ? `<span class="col typecol" style="width:auto;white-space:nowrap">${info.iconsHtml}</span>`
-                     : `<span class="col abilitydesccol">${info.descHtml}</span>`);
+                if (info.desc) a.title = info.desc;
+                a.innerHTML = filterRowHtml(
+                    info.label, currentSearchQuery(engine), bang,
+                    info.iconsHtml
+                    ? `<span class="col typecol" style="width:auto;white-space:nowrap">${info.iconsHtml}</span> `
+                    : ''
+                );
             } else if (bang && (entry.startsWith('type|') || entry.startsWith('category|'))) {
                 const name = a.querySelector('.namecol');
                 if (name && !name.dataset.qolNeg) {
@@ -5317,9 +5600,43 @@
         }
     }
 
+        // Length of the label prefix the query matches (0 if it matched an alias / key instead).
+    function prefixMatchEnd(label, query) {
+        const q = toSearchId(query);
+        if (!q || !toSearchId(label).startsWith(q)) return 0;
+        let seen = 0;
+        for (let i = 0; i < label.length; i++) {
+            if (/[a-z0-9]/i.test(label[i]) && ++seen === q.length) return i + 1;
+        }
+        return 0;
+    }
+
+    // `prefix` ("Not ", "!") is shown but never highlighted.
+    function highlightedLabel(label, start, end, prefix = '') {
+        const esc = BattleLog.escapeHTML;
+        const s = Math.max(0, Math.min(label.length, Number(start) || 0));
+        const e = Math.max(s, Math.min(label.length, Number(end) || 0));
+        return esc(prefix) + (e > s
+            ? esc(label.slice(0, s)) + '<b>' + esc(label.slice(s, e)) + '</b>' + esc(label.slice(e))
+            : esc(label));
+    }
+
+    // What's typed in the search box, as the engine stored it (our bypass keys carry a prefix).
+    function currentSearchQuery(engine) {
+        return toSearchId(String(engine?.query || '').replace(/^mv:/, ''));
+    }
+
+    // Native-looking suggestion row: label with the typed prefix highlighted, then the "Filter" tag.
+    function filterRowHtml(label, query, prefix = '', extraHtml = '') {
+        return `<span class="col namecol qol-done">${highlightedLabel(label, 0, prefixMatchEnd(label, query), prefix)}</span> ` +
+            extraHtml + '<span class="col filtercol"><em>Filter</em></span>';
+    }
+
     function pokemonFilterRowLabel(rawId, negated) {
         const id = String(rawId).toLowerCase();
         const dex = getTeambuilderRoom()?.search?.engine?.dex;
+        const color = colorRowName(id);
+        if (color) return `${negated ? 'Not ' : ''}${color}`;
 
         if (id.startsWith(CUSTOM_TOGGLE_PREFIX)) {
             const label = CUSTOM_TOGGLE_FILTERS[id.slice(CUSTOM_TOGGLE_PREFIX.length)];
@@ -5357,14 +5674,14 @@
             const id = entry.slice(sep + 1);
 
             if (kind === 'ability') {
-                if (a.querySelector('.qol-pkf')) continue;
+                if (a.querySelector('.qol-done')) continue;
                 const label = pokemonFilterRowLabel(id, negated);
                 if (label) {
-                    a.innerHTML =
-                        `<span class="col namecol qol-pkf">${BattleLog.escapeHTML(label)}</span> ` +
-                        '<span class="col abilitydesccol"></span>';
+                    const not = label.startsWith('Not ') ? 'Not ' : '';
+                    a.innerHTML = filterRowHtml(label.slice(not.length), currentSearchQuery(engine), not);
                     continue;
                 }
+
             }
 
             const name = a.querySelector('.namecol, .movenamecol');
@@ -5390,7 +5707,6 @@
         ['self challenge button', installSelfChallengeButton],
         ['import format button', installImportFormatButton],
         ['custom format names', decorateCustomFormatNames],
-        ['imported format picker', decorateImportedFormatPicker],
         ['teambuilder stats button', installTeambuilderStatsButton],
         ['imported format selection', installImportedFormatClick],
         ['custom format dropdown', decorateCustomFormatDropdown],
@@ -5403,7 +5719,7 @@
 
         let scheduled = false;
 
-        // Runs at document-start, so observe documentElement (body may not exist yet).
+        // documentElement itself can still be null at userscript document-start.
         new MutationObserver(() => {
             if (scheduled) return;
             scheduled = true;
@@ -5417,7 +5733,7 @@
                     }
                 }
             });
-        }).observe(document.documentElement, {childList: true, subtree: true});
+        }).observe(document, {childList: true, subtree: true});
     }
 
 
@@ -5438,8 +5754,8 @@
     `wss://${window.Config?.defaultserver?.host || 'sim3.psim.us'}/showdown/websocket`;
 
     const SELF_CHALLENGE_MOD_RULES = Object.fromEntries(MOD_DEFINITIONS
-        .filter((definition) => definition.challengeRule)
-        .map((definition) => [definition.id, definition.challengeRule]));
+                                                        .filter((definition) => definition.challengeRule)
+                                                        .map((definition) => [definition.id, definition.challengeRule]));
 
     function selfChallengeFormat(format) {
         const [base, ruleText = ''] = String(format || '').split('@@@');
@@ -5701,7 +6017,7 @@
         // ---- guest P2 ----
         async function onGuestMessage(ws, s) {
             if (S.stopping) console.log('[self] guest reply while stopping:', s.slice(0, 300));
-                        // Surface the guest's own errors (e.g. "Your team was rejected...") on the main client.
+            // Surface the guest's own errors (e.g. "Your team was rejected...") on the main client.
             if (!s.startsWith('>')) {
                 const popup = s.split('\n').find((l) => l.startsWith('|popup|'));
                 if (popup) {
@@ -6002,7 +6318,14 @@
         button.type = 'button';
         button.id = 'qol-self-challenge';
         button.className = 'button mainmenu4'; // same look as Tournaments
-        button.style.cursor = 'pointer';
+        Object.assign(button.style, {
+            cursor: 'pointer',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            textAlign: 'center',
+            paddingBlock: '4px',
+        });
         button.textContent = 'Challenge Yourself';
         button.addEventListener('click', (e) => {
             e.preventDefault();
@@ -6127,7 +6450,7 @@
         if (!text.includes('@@@') || (!text.includes(']') && !text.includes('|'))) return format;
         try {
             const encoded = btoa(unescape(encodeURIComponent(text)))
-                .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+            .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
             return STORED_CUSTOM_FORMAT_PREFIX + encoded;
         } catch (e) {
             return format;
@@ -6137,7 +6460,7 @@
         if (!String(format || '').startsWith(STORED_CUSTOM_FORMAT_PREFIX)) return format;
         try {
             const encoded = String(format).slice(STORED_CUSTOM_FORMAT_PREFIX.length)
-                .replace(/-/g, '+').replace(/_/g, '/');
+            .replace(/-/g, '+').replace(/_/g, '/');
             const padded = encoded + '='.repeat((4 - encoded.length % 4) % 4);
             return decodeURIComponent(escape(atob(padded)));
         } catch (e) {
@@ -6187,26 +6510,26 @@
         const storage = window.Storage;
         if (!storage) return false;
         const packed = patchMethod(storage, 'packAllTeams', '__qolSafeCustomFormatPack', (original) =>
-            function (teams) {
-                const safeTeams = (teams || []).map((team) => team?.format?.includes('@@@')
-                    ? {...team, format: encodeStoredCustomFormat(team.format)}
-                    : team);
-                return original.call(this, safeTeams);
-            });
+                                   function (teams) {
+            const safeTeams = (teams || []).map((team) => team?.format?.includes('@@@')
+                                                ? {...team, format: encodeStoredCustomFormat(team.format)}
+                                                : team);
+            return original.call(this, safeTeams);
+        });
         const unpacked = patchMethod(storage, 'unpackAllTeams', '__qolSafeCustomFormatUnpack', (original) =>
-            function (...args) {
-                const teams = original.apply(this, args);
-                if (!Array.isArray(teams)) return teams;
-                for (const team of teams) {
-                    if (!team) continue;
-                    const decoded = decodeStoredCustomFormat(team.format);
-                    if (decoded !== team.format) {
-                        team.format = decoded;
-                        team.gen = Number(String(decoded).match(/^gen(\d+)/i)?.[1]) || team.gen || 9;
-                    }
+                                     function (...args) {
+            const teams = original.apply(this, args);
+            if (!Array.isArray(teams)) return teams;
+            for (const team of teams) {
+                if (!team) continue;
+                const decoded = decodeStoredCustomFormat(team.format);
+                if (decoded !== team.format) {
+                    team.format = decoded;
+                    team.gen = Number(String(decoded).match(/^gen(\d+)/i)?.[1]) || team.gen || 9;
                 }
-                return teams;
-            });
+            }
+            return teams;
+        });
         // Storage may have unpacked its teams before this patch was installed.
         // Decode legacy tokens in the live array too, especially after a script
         // update where the unpack hook can otherwise miss the first load.
@@ -6254,8 +6577,8 @@
     function decorateImportedFormatPicker() {
         if (IS_DAMAGE_CALC) return;
         const dropdown = window.app?.rooms?.formatdropdown || Object.values(window.app?.rooms || {}).find((room) =>
-            room?.id === 'formatdropdown' || room?.el?.querySelector?.('.options-column')
-        );
+                                                                                                          room?.id === 'formatdropdown' || room?.el?.querySelector?.('.options-column')
+                                                                                                         );
         // Showdown renders the format picker as a global popup, not an app room,
         // so on current clients there is no `rooms.formatdropdown` to inspect.
         const root = dropdown?.el || document.querySelector('.popupmenu');
@@ -6265,10 +6588,10 @@
         const formats = importedCustomFormats();
         const query = toSearchId(root.querySelector('input[name="search"]')?.value || '');
         const visibleFormats = formats
-            .filter((entry) => !query || toSearchId(entry.label).includes(query));
+        .filter((entry) => !query || toSearchId(entry.label).includes(query));
         const findChallengeable = (container) => {
             const title = [...container.querySelectorAll('summary, button, h2, h3, [role="heading"]')]
-                .find((el) => el.textContent.trim() === 'Challengeable OMs');
+            .find((el) => el.textContent.trim() === 'Challengeable OMs');
             return title?.closest('details, [role="group"], .format-section') || title?.parentElement || null;
         };
         let challengeable = findChallengeable(root) || findChallengeable(document);
@@ -6285,9 +6608,9 @@
         if (!challengeable) return;
         challengeable.querySelectorAll('.qol-challengeable-format, .qol-challengeable-om-ultramix')
             .forEach((button) => {
-                const li = button.closest('li');
-                if (li) li.remove(); else button.remove();
-            });
+            const li = button.closest('li');
+            if (li) li.remove(); else button.remove();
+        });
         document.querySelectorAll('.qol-imported-oms').forEach((section) => section.remove());
         const nativeButton = challengeable.querySelector('button[name="selectFormat"]');
     }
@@ -6298,24 +6621,22 @@
         const root = room?.el;
         if (!root || room.curTeam) return;
         const clearButton = [...root.querySelectorAll('button')].find((button) =>
-            /clear.*teams/i.test([button.textContent, button.title, button.getAttribute('aria-label'),
-                button.getAttribute('name'), button.getAttribute('data-cmd')].join(' '))
-        );
+                                                                      /clear.*teams/i.test([button.textContent, button.title, button.getAttribute('aria-label'),
+                                                                                            button.getAttribute('name'), button.getAttribute('data-cmd')].join(' '))
+                                                                     );
         root.querySelector('.qol-import-formats-button')?.remove();
         let button = root.querySelector('.qol-teambuilder-stats-button');
         if (!button) {
             button = document.createElement('button');
             button.type = 'button';
             button.className = 'button qol-teambuilder-stats-button';
-            button.textContent = 'Stats';
+            button.innerHTML = '<i class="fa fa-bar-chart"></i> Stats';
             button.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 try { openUsageStatsTab(); } catch (err) { console.error(LOG, 'Stats page failed:', err); }
             });
         }
-        button.className = 'button qol-teambuilder-stats-button';
-        button.textContent = 'Stats';
         if (clearButton?.parentElement) {
             if (button.nextElementSibling !== clearButton) clearButton.before(button);
         } else if (!button.isConnected) {
@@ -6572,7 +6893,7 @@
 
         let importBtn = row.querySelector(':scope > .qol-fmt-btn');
         if (!importBtn) {
-            importBtn = makeButton('qol-fmt-btn', '<i class="fa fa-download"></i> Import format',
+            importBtn = makeButton('qol-fmt-btn', '<i class="fa fa-upload"></i> Import format',
                                    'Paste a /challenge line to give this team a custom-rules format', openImportFormatPopup);
         }
         importBtn.disabled = false;
@@ -6631,11 +6952,11 @@
 
                 // Keep this temporary guest's challenge traffic out of the main client's UI.
                 if (data.split('\n').every((line) =>
-                    !line.startsWith('|updatechallenges|') || !toSearchId(line).includes(toSearchId(botName))
-                )) return state.origReceive.apply(this, arguments);
+                                           !line.startsWith('|updatechallenges|') || !toSearchId(line).includes(toSearchId(botName))
+                                          )) return state.origReceive.apply(this, arguments);
                 const kept = data.split('\n').filter((line) =>
-                    !line.startsWith('|updatechallenges|') || !toSearchId(line).includes(toSearchId(botName))
-                );
+                                                     !line.startsWith('|updatechallenges|') || !toSearchId(line).includes(toSearchId(botName))
+                                                    );
                 if (!kept.length) return;
                 return state.origReceive.call(this, kept.join('\n'));
             }
@@ -6675,8 +6996,8 @@
             }
 
             if (data.split('\n').some((line) =>
-                line.startsWith('|updateuser|') && toSearchId(line.split('|')[2]) === toSearchId(botName) && line.split('|')[3] === '1'
-            )) {
+                                      line.startsWith('|updateuser|') && toSearchId(line.split('|')[2]) === toSearchId(botName) && line.split('|')[3] === '1'
+                                     )) {
                 getTeambuilderRoom()?.save?.();
                 app.send('/utm ' + selfPackedOf(team));
                 state.sentChallenge = true;
@@ -6879,53 +7200,53 @@
     }
 
     function decorateCustomFormatDropdown() {
-    if (IS_DAMAGE_CALC) return;
-    const popup = document.querySelector('.ps-popup');
-    if (!popup || popup.querySelector('.qol-custom-formats')) return;
+        if (IS_DAMAGE_CALC) return;
+        const popup = document.querySelector('.ps-popup');
+        if (!popup || popup.querySelector('.qol-custom-formats')) return;
 
-    const sections = [...popup.querySelectorAll('details[section]')];
-    if (!sections.length || !popup.querySelector(FORMAT_BTN)) return;
+        const sections = [...popup.querySelectorAll('details[section]')];
+        if (!sections.length || !popup.querySelector(FORMAT_BTN)) return;
 
-    const formats = savedCustomFormats();
-    if (!formats.length) return;
+        const formats = savedCustomFormats();
+        if (!formats.length) return;
 
-    // Place it after the Challengeable section (fallback: after the last section).
-    const anchor =
-        sections.find((d) => /challengeable/i.test(d.querySelector('summary')?.textContent || '')) ||
-        sections[sections.length - 1];
+        // Place it after the Challengeable section (fallback: after the last section).
+        const anchor =
+              sections.find((d) => /challengeable/i.test(d.querySelector('summary')?.textContent || '')) ||
+              sections[sections.length - 1];
 
-    const details = document.createElement('details');
-    details.className = 'qol-custom-formats';
-    details.setAttribute('section', 'Custom Formats');
-    details.open = true;
+        const details = document.createElement('details');
+        details.className = 'qol-custom-formats';
+        details.setAttribute('section', 'Custom Formats');
+        details.open = true;
 
-    const summary = document.createElement('summary');
-    summary.style.cursor = 'pointer';
-    const strong = document.createElement('strong');
-    strong.style.color = '#579';
-    strong.textContent = 'Custom Formats';
-    summary.appendChild(strong);
-    details.appendChild(summary);
+        const summary = document.createElement('summary');
+        summary.style.cursor = 'pointer';
+        const strong = document.createElement('strong');
+        strong.style.color = '#579';
+        strong.textContent = 'Custom Formats';
+        summary.appendChild(strong);
+        details.appendChild(summary);
 
-    for (const format of formats) {
-        const li = document.createElement('li');
-        const btn = document.createElement('button');
-        btn.name = 'selectFormat';
-        btn.value = format;
-        btn.className = 'option';
-        btn.dataset.qolCustom = '1';
-        btn.style.cursor = 'pointer';
-        btn.textContent = displayFormatName(format);
-        li.appendChild(btn);
-        details.appendChild(li);
+        for (const format of formats) {
+            const li = document.createElement('li');
+            const btn = document.createElement('button');
+            btn.name = 'selectFormat';
+            btn.value = format;
+            btn.className = 'option';
+            btn.dataset.qolCustom = '1';
+            btn.style.cursor = 'pointer';
+            btn.textContent = displayFormatName(format);
+            li.appendChild(btn);
+            details.appendChild(li);
+        }
+
+        // The menu separates sections with two empty <p>s: skip past the ones
+        // after the anchor, then add the same spacing after ours.
+        let after = anchor;
+        while (after.nextElementSibling?.tagName === 'P') after = after.nextElementSibling;
+        after.after(details, document.createElement('p'), document.createElement('p'));
     }
-
-    // The menu separates sections with two empty <p>s: skip past the ones
-    // after the anchor, then add the same spacing after ours.
-    let after = anchor;
-    while (after.nextElementSibling?.tagName === 'P') after = after.nextElementSibling;
-    after.after(details, document.createElement('p'), document.createElement('p'));
-}
 
     // Picking a custom format while a team is open applies it directly
     // (the native handler doesn't know these format strings).
@@ -7369,6 +7690,7 @@
             Object.entries(USAGE_SORTS).map(([k, s]) => `<option value="${k}">${s.label}</option>`).join('') +
             '</select><button type="button" class="button" data-ctl="dir"></button></span></label>' +
             '<label class="qol-us-grow"><span>Filter</span>' +
+            '<input class="textbox" type="search" data-ctl="filter" placeholder="Pokémon name" autocomplete="off" spellcheck="false"></label>' +
 
             '</div>' +
             '<div class="qol-us-status" data-out="status"></div>' +
@@ -9360,6 +9682,7 @@
             patchItemSearchSort(),
             patchItemSearchSortRow(),
             patchItemSearchFortemons(),
+            patchItemSearchBans(),
 
             // search: ability + move pools per format
             patchAbilitySearchResults(),
@@ -9373,6 +9696,7 @@
             patchSearchRenderer(),
 
             // teambuilder: stats, icons, chooser
+            patchMonocolorAddPokemon(),
             patchGetStat(),
             patchStatForm(),
             patchRenderSetTypeIcons(),
@@ -9435,7 +9759,7 @@
             const search = room?.search?.engine?.typedSearch;
             const natdex = fmtHas(format, 'natdex', 'nationaldex');
             const tier = natdex ? (search && natdexTierMap(search)?.get(sp.id)) || '(unknown)' :
-                formatSpeciesTier(search, sp);
+            formatSpeciesTier(search, sp);
             const bans = getMergedBans(room);
             const baseId = toID(sp.baseSpecies || sp.name);
             return {
@@ -9450,6 +9774,7 @@
         },
         parse: parseFormatImport,
         active: (room = getActiveTeambuilderRoom()) => getActiveMods(room),
+        typemons: (room = getActiveTeambuilderRoom()) => typemonsType(room),
         remove: (room = getActiveTeambuilderRoom()) => removeCustomRules(room),
         stats: (set, room = getActiveTeambuilderRoom()) =>
         computeModsBaseStats(getActiveMods(room), {dex: room?.curTeam?.dex, set, room}),
