@@ -2,7 +2,7 @@
 // @name         Pokémon Showdown Teambuilder QOL
 // @author       jl
 // @namespace    https://github.com/Jake18236/showdown-teambuilder-mod
-// @version      16.0.0
+// @version      16.0.1
 // @description  Adds Teambuilder and damage calculator support for some OMs
 // @match        https://play.pokemonshowdown.com/*
 // @match        https://smogtours.psim.us/*
@@ -415,10 +415,29 @@
         }
     }
 
+    // A native stat render is recursive: updateStatForm -> getStat/updateStatGraph
+    // -> guesser/optimizer -> getStat. All those paths share a Dex instance.
+    // Applying a species transform twice is incorrect (35 -> 70 -> 140 in BnB).
+    const activeStatOverrides = new WeakMap();
+    const isStatOverrideActive = (dex, speciesId) => {
+        const active = dex && activeStatOverrides.get(dex);
+        return !!active && active.has(toID(speciesId));
+    };
     function withSpeciesBaseStats(dex, speciesId, baseStats, fn) {
-        const species = dex?.species?.get?.(speciesId);
-        if (!species?.exists || !baseStats) return fn();
-        return withSpeciesOverrides(dex, species, {baseStats: copy(baseStats)}, fn);
+        if (!dex?.species?.get || !baseStats) return fn();
+        const id = toID(speciesId);
+        let active = activeStatOverrides.get(dex);
+        if (active?.has(id)) return fn(); // already transformed by an outer wrapper
+        const species = dex.species.get(speciesId);
+        if (!species?.exists) return fn();
+        if (!active) { active = new Set(); activeStatOverrides.set(dex, active); }
+        active.add(id);
+        try {
+            return withSpeciesOverrides(dex, species, {baseStats: copy(baseStats)}, fn);
+        } finally {
+            active.delete(id);
+            if (!active.size) activeStatOverrides.delete(dex);
+        }
     }
 
     // Same idea for call sites that read `pokemon.getSpecies()`.
@@ -5249,10 +5268,13 @@
             set = set || this.curSet;
             if (!set) return 0;
 
+            const dex = this.curTeam?.dex;
+            // The outer stat-form/optimizer wrapper already provided modified
+            // baseStats. Recomputing here would double-apply BnB/Tier Shift.
+            if (isStatOverrideActive(dex, set.species)) return callOriginal();
             const mods = getActiveMods(this);
             if (!mods.length) return callOriginal();
 
-            const dex = this.curTeam?.dex;
             const baseStats = computeModsBaseStats(mods, {dex, set, room: this});
             if (!baseStats) return callOriginal();
 
@@ -5266,6 +5288,9 @@
         const mods = getActiveMods(room);
         const set = room?.curSet;
         if (!mods.length || !set?.species) return;
+        // Nested native graph renders will be followed by the outer form's
+        // final column update; never fold stats from a temporarily patched Dex.
+        if (isStatOverrideActive(room.curTeam?.dex, set.species)) return;
 
         const baseStats = computeModsBaseStats(mods, {dex: room.curTeam?.dex, set, room});
         if (!baseStats) return;
@@ -5282,6 +5307,7 @@
         const set = room?.curSet;
         const dex = room?.curTeam?.dex;
         if (!set?.species || !dex?.species?.get) return fn();
+        if (isStatOverrideActive(dex, set.species)) return fn();
         const mods = getActiveMods(room);
         if (!mods.length) return fn();
         const stats = computeModsBaseStats(mods, {dex, set, room});
@@ -5697,6 +5723,7 @@
             const callOriginal = () => original.call(this, stat, set, evOverride, natureOverride);
             if (!set?.species || !this.dex?.species?.get) return callOriginal();
 
+            if (isStatOverrideActive(this.dex, set.species)) return callOriginal();
             const mod = modFromFormat(this.__qolChallengeFormat || this.formatid);
             if (!BATTLE_GUESSER_MODS.has(mod)) return callOriginal();
 
@@ -5714,6 +5741,7 @@
 
             const room = getTeambuilderRoom();
             if (!isGodlyGiftFormat(room) || !set?.species || !this.dex?.species?.get) return callOriginal();
+            if (isStatOverrideActive(this.dex, set.species)) return callOriginal();
 
             const baseStats = godlyGiftBaseStats(room, set);
             return baseStats ? withSpeciesBaseStats(this.dex, set.species, baseStats, callOriginal) : callOriginal();
