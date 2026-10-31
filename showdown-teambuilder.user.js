@@ -2,7 +2,7 @@
 // @name         Pokémon Showdown Teambuilder QOL
 // @author       jl
 // @namespace    https://github.com/Jake18236/showdown-teambuilder-mod
-// @version      15.1.0
+// @version      17.0.0
 // @description  Adds Teambuilder and damage calculator support for some OMs
 // @match        https://showdown.lysio.ovh/*
 // @match        https://smogtours.psim.us/*
@@ -66,6 +66,7 @@
         FORTEMONS: 'fortemons',
         SKETCHMONS: 'sketchmons',
         TYPEMONS: 'typemons',
+        STABMONS: 'stabmons',
         // Movepool / ability-list mods (no stat changes of their own)
         CONVERGENCE: 'convergence',
         ALPHABET_CUP: 'alphabetCup',
@@ -105,8 +106,9 @@
             label: 'Mix and Mega', challengeRule: 'mixandmegamod',
         },
         {
-            id: MOD.BAD_N_BOOSTED, formatKeywords: ['badnboosted'],
+            id: MOD.BAD_N_BOOSTED, formatKeywords: ['badnboosted', 'staaabnb'],
             label: 'Bad ’n Boosted', challengeRule: 'badnboostedmod',
+            modifySpeciesPriority: 2,
             calcOm: 'badnboosted',
         },
         {id: MOD.GODLY_GIFT, label: 'Godly Gift', modifySpeciesPriority: 3},
@@ -159,12 +161,13 @@
             label: 'Sketchmons', challengeRule: 'sketchmonsmod',
         },
         {id: MOD.TYPEMONS, providerKeywords: ['typemons'], label: 'Typemons'},
+        {id: MOD.STABMONS, providerKeywords: ['stabmons', 'staaab'], label: 'STABmons', challengeRule: 'STABmons Move Legality'},
         {id: MOD.CONVERGENCE, providerKeywords: ['convergence'], label: 'Convergence'},
         {id: MOD.ALPHABET_CUP, providerKeywords: ['alphabetcup'], label: 'Alphabet Cup'},
         {id: MOD.ALL_MOVES, providerKeywords: ['camove'], label: 'Every Move'},
         {
             id: MOD.ALMOST_ANY_ABILITY,
-            providerKeywords: ['pokebilitiesaaa', 'pokeaaa', 'almostanyability', 'aaarestrictedabilities'],
+            providerKeywords: ['pokebilitiesaaa', 'pokeaaa', 'almostanyability', 'aaarestrictedabilities', 'staaab'],
             label: 'Almost Any Ability',
         },
     ];
@@ -263,6 +266,7 @@
             for (const rule of rules.split(',')) {
                 const token = rule.trim();
                 if (!token) continue;
+                if (/^convergence(?:\s+legality|mod)?$/i.test(token)) add(MOD.CONVERGENCE);
 
                 // Removing a restriction means what it says: "!Obtainable Abilities" = any ability is
                 // legal (AAA), "!Obtainable Moves" = any move is legal, "!Obtainable" = both.
@@ -299,6 +303,7 @@
     // edited when the search belongs to its format, so the team's extras apply too.
     const searchFormatId = (f) => stripGen(fmtId(String(f || '').split('@@@')[0]));
     function modsForSearch(search) {
+        if (search?.__qolProviderMods) return search.__qolProviderMods;
         const room = getActiveTeambuilderRoom();
         const team = room?.curTeam;
         const engine = room?.search?.engine;
@@ -335,6 +340,19 @@
         }
 
         refreshSearch(room, {clearBase: true});
+        // Showdown's native editor may create the EV controls only after its
+        // update finishes; recompute once on the next frame, not per mutation.
+        if (room.curSet && !room.__qolFormatStatRefreshPending) {
+            room.__qolFormatStatRefreshPending = true;
+            requestAnimationFrame(() => {
+                room.__qolFormatStatRefreshPending = false;
+                if (getActiveTeambuilderRoom() !== room || !room.curSet) return;
+                try {
+                    room.updateStatForm?.();
+                    room.updateStatGraph?.();
+                } catch (e) { console.warn(LOG, 'Deferred stat refresh failed:', e); }
+            });
+        }
     }
 
     // ====================================================================
@@ -398,10 +416,29 @@
         }
     }
 
+    // A native stat render is recursive: updateStatForm -> getStat/updateStatGraph
+    // -> guesser/optimizer -> getStat. All those paths share a Dex instance.
+    // Applying a species transform twice is incorrect (35 -> 70 -> 140 in BnB).
+    const activeStatOverrides = new WeakMap();
+    const isStatOverrideActive = (dex, speciesId) => {
+        const active = dex && activeStatOverrides.get(dex);
+        return !!active && active.has(toID(speciesId));
+    };
     function withSpeciesBaseStats(dex, speciesId, baseStats, fn) {
-        const species = dex?.species?.get?.(speciesId);
-        if (!species?.exists || !baseStats) return fn();
-        return withSpeciesOverrides(dex, species, {baseStats: copy(baseStats)}, fn);
+        if (!dex?.species?.get || !baseStats) return fn();
+        const id = toID(speciesId);
+        let active = activeStatOverrides.get(dex);
+        if (active?.has(id)) return fn(); // already transformed by an outer wrapper
+        const species = dex.species.get(speciesId);
+        if (!species?.exists) return fn();
+        if (!active) { active = new Set(); activeStatOverrides.set(dex, active); }
+        active.add(id);
+        try {
+            return withSpeciesOverrides(dex, species, {baseStats: copy(baseStats)}, fn);
+        } finally {
+            active.delete(id);
+            if (!active.size) activeStatOverrides.delete(dex);
+        }
     }
 
     // Same idea for call sites that read `pokemon.getSpecies()`.
@@ -430,6 +467,7 @@
     }
 
     const clearSearchCache = (search) => {
+        search.__qolProviderPools = null;
         search.baseResults = null;
         search.baseIllegalResults = null;
         search.illegalReasons = null;
@@ -619,7 +657,38 @@
     // is requested here: getMergedBans() asks the server once per format.
     const isGodlyGiftFormat = (room) => fmtHas(room?.curTeam?.format, 'godlygift');
     const isTierShiftAAAFormat = (room) => formatActive(room, 'tiershiftaaa', 'tsa');
-    const isConvergenceFormat = (room) => formatActive(room, 'convergence', 'conv');
+    // The Convergence Megamons challenge code is based on Anything Goes and adds
+    // Convergence Legality, !Obtainable Formes and individual +Mega entries.
+    // It is NOT Mix and Mega: the Mega formes are starting species, not stone effects.
+    // Keep the same path for the eventual standalone Showdown format.
+    function isConvergenceMegamons(format) {
+        const name = String(format || '').split('@@@')[0];
+        if (fmtHas(name, 'convergencemegamons', 'megamonsconvergence')) return true;
+        const rules = String(format || '').split('@@@').slice(1).join('@@@');
+        return /(?:^|,)\s*convergence legality\s*(?:,|$)/i.test(rules) &&
+            (/(?:^|,)\s*!\s*obtainable formes\s*(?:,|$)/i.test(rules) ||
+             /(?:^|,)\s*\+[a-z0-9-]+-mega(?:-[xyz])?\s*(?:,|$)/i.test(rules));
+    }
+
+    function isConvergenceEnabled(format) {
+        return fmtHas(format, 'convergence') || isConvergenceMegamons(format);
+    }
+
+    function explicitlyUnbannedForms(format) {
+        const rules = String(format || '').split('@@@').slice(1).join('@@@');
+        const ids = new Set();
+        for (const token of rules.split(',')) {
+            const match = /^\s*\+\s*(.+?)\s*$/.exec(token);
+            if (match) ids.add(toID(match[1]));
+        }
+        return ids;
+    }
+
+    const isConvergenceFormat = (room) => {
+        const format = room?.curTeam?.format;
+        if (isConvergenceMegamons(format)) return true;
+        return formatActive(room, 'convergence', 'conv');
+    };
 
     // ---------- parsing ----------
 
@@ -742,7 +811,7 @@
             if (bansWholeSpecies(token, sp)) bans.unbannedBase.add(sp.id);
         }
 
-        for (const token of sections.Restricted || []) {
+        for (const token of [...(sections.Restricted || []), ...(sections.Restrictions || [])]) {
             const sp = Dex.species.get(token);
             if (!sp?.exists) {
                 const hit = classifyRuleToken(token);
@@ -793,7 +862,8 @@
     function applyCustomRuleTokens(base, tokens) {
         const bans = cloneBans(base);
 
-        for (const raw of tokens) {
+        for (let raw of tokens) {
+            raw = raw.trim();
             const sign = raw[0];
             if (sign !== '-' && sign !== '+' && sign !== '*') {
                 bans.ruleset.push(raw); // "!Obtainable Abilities", "Terastal Clause"...: rules, not lists
@@ -857,12 +927,14 @@
     }
 
     // The format's bans with the team's custom rules applied; null until the base list has loaded.
-    function getMergedBansForFormat(format) {
+    function getMergedBansForFormat(format, seen = new Set()) {
+        const baseId = fmtId(String(format || '').split('@@@')[0]);
+        if (!baseId || seen.has(baseId)) return emptyBanSections();
+        seen.add(baseId);
         // Convergence has a named list of its own, but is excluded from the
         // generic /tier cache. Keep its bans available to the ability search
         // decorator as well as the movepool provider.
-        if (fmtHas(format, 'convergence')) {
-            if (!convergenceBans) return null;
+        if (!isConvergenceMegamons(format) && fmtHas(format, 'convergence') && convergenceBans) {
             const rules = String(format).split('@@@')[1] || '';
             if (!rules.trim()) return convergenceBans;
             const tokens = rules.split(',').map((t) => t.replace(/\s+/g, ' ').trim()).filter(Boolean);
@@ -876,13 +948,20 @@
         if (!entry.loaded || !entry.bans) return null;
 
         const rules = String(format).split('@@@')[1] || '';
-        if (!rules.trim()) return entry.bans;
-
-        if (!entry.merged || entry.merged.rules !== rules) {
-            const tokens = rules.split(',').map((t) => t.replace(/\s+/g, ' ').trim()).filter(Boolean);
-            entry.merged = {rules, bans: applyCustomRuleTokens(entry.bans, tokens)};
+        let merged = cloneBans(entry.bans);
+        const tokens = rules.split(',').map((t) => t.trim()).filter(Boolean);
+        const removed = new Set(tokens.filter((t) => t.startsWith('!')).map((t) => toID(t.slice(1))));
+        for (const rule of [...entry.bans.ruleset, ...tokens]) {
+            if (/^[!+*-]/.test(rule)) continue;
+            const id = toID(rule);
+            if (removed.has(id) || !window.BattleFormats?.[id]) continue;
+            const inherited = getMergedBansForFormat(id, new Set(seen));
+            if (!inherited) continue;
+            for (const key of Object.keys(merged)) {
+                if (merged[key] instanceof Set) for (const value of inherited[key] || []) merged[key].add(value);
+            }
         }
-        return entry.merged.bans;
+        return applyCustomRuleTokens(merged, tokens);
     }
 
     const getMergedBans = (room) => getMergedBansForFormat(room?.curTeam?.format);
@@ -908,8 +987,8 @@
     }
 
     function parseConvergenceBanlist(html) {
-        const sections = parseFormatSectionTokens(html, '[Gen 9] Convergence');
-        if (!sections) return false;
+        const sections = parseFormatSectionTokens(html, null);
+        if (!sections || !Object.keys(sections).length) return false;
 
         convergenceBans = parseBanSections(sections);
         BL.conv.loaded = true;
@@ -927,12 +1006,9 @@
 
     // ---------- generic (every other format) ----------
     //
-    // Build the tier portion of ordinary format bans locally. Showdown's
-    // `/tier` command lists members of a tier; it does not return a format's
-    // inherited banlist, so it cannot be used to discover those bans.
-
-    const GENERIC_BAN_EXCLUDED = ['tiershiftaaa', 'convergence', 'aaaubers'];
-    const genericBanlists = new Map(); // generation-aware formatId -> locally inferred tier bans
+    // Infer standard tier bans immediately, then fill in the format's declared
+    // lists from /formathelp. Named format inheritance is merged at read time.
+    const genericBanlists = new Map();
 
     // Keep the generation in the key: `/tier gen5pu` and `/tier gen9pu` have
     // different inherited bans. Some client versions omit it from search.format,
@@ -943,7 +1019,7 @@
             const teamId = fmtId(String(getActiveTeambuilderRoom()?.curTeam?.format || '').split('@@@')[0]);
             if (/^gen\d+/.test(teamId) && stripGen(teamId) === id) id = teamId;
         }
-        if (!id || GENERIC_BAN_EXCLUDED.some((k) => id.includes(k))) return null;
+        if (!id) return null;
         return id;
     }
 
@@ -972,13 +1048,18 @@
         return bans;
     }
 
-    // Cache inferred tier bans without sending a `/tier` chat command.
+    // Keep explicit custom rules usable while the format details are loading.
     function requestGenericBanlist(id) {
         let entry = genericBanlists.get(id);
-        if (entry) return entry;
-        entry = {loaded: true, silent: false, sentAt: Date.now(), bans: inferredTierBans(id)};
-        genericBanlists.set(id, entry);
-        console.log(LOG, 'Using generation-aware tier bans for:', id, [...entry.bans.tiers]);
+        if (!entry) {
+            entry = {loaded: true, silent: false, bans: inferredTierBans(id)};
+            genericBanlists.set(id, entry);
+        }
+        if (!entry.sentAt && window.app?.send) {
+            entry.sentAt = Date.now();
+            entry.silent = true;
+            app.send('/formathelp ' + id);
+        }
         return entry;
     }
 
@@ -1015,8 +1096,15 @@
         const sections = parseFormatSectionTokens(html, null);
         if (!sections) return null;
 
+        if (!Object.keys(sections).length) return null;
         entry.bans = parseBanSections(sections);
+        for (const tier of inferredTierBans(formatId).tiers) entry.bans.tiers.add(tier);
+        entry.merged = null;
         entry.loaded = true;
+        if (isConvergenceMegamons(getActiveTeambuilderRoom()?.curTeam?.format) || isConvergenceMegamons(formatId)) {
+            convergenceIndexCache.clear();
+            convergenceMoveCache.clear();
+        }
         console.log(LOG, `Loaded bans for ${title}`);
 
 
@@ -1024,7 +1112,7 @@
         entry.silent = false; // later manual /tier replies show normally
 
         const room = getTeambuilderRoom();
-        if (room?.search?.engine?.typedSearch?.searchType === 'pokemon') refreshSearch(room);
+        if (room?.search?.engine?.typedSearch) refreshSearch(room, {clearBase: true});
         const engine = room?.search?.engine;
         if (engine?.abilitySearch) clearSearchCache(engine.abilitySearch);
         if (engine?.typedSearch?.searchType === 'ability') refreshSearch(room, {clearBase: true});
@@ -1967,41 +2055,61 @@
         return types.join('/');
     }
 
-    // Every legal donor species sharing a typing, cached per generation.
-    function getConvergenceGroup(dex, species) {
-        let index = convergenceIndexCache.get(dex.gen);
-
+    // Do not cache Convergence donors globally by generation: the mega-enabled
+    // challenge code, the future named format, and ordinary Convergence each have
+    // different legal pools. Parse local explicit unbans immediately, even while
+    // the /formathelp reply is in flight.
+    function getConvergenceGroup(dex, species, format) {
+        const megamons = isConvergenceMegamons(format);
+        const explicitlyAllowed = megamons ? explicitlyUnbannedForms(format) : new Set();
+        const bans = megamons ? getMergedBansForFormat(format) : convergenceBans;
+        const bannedIds = bans?.species || new Set();
+        const bannedBases = bans?.baseSpecies || new Set();
+        const cacheKey = `${dex.gen}|${String(format || 'gen9convergence')}|${megamons ? 'mega' : 'normal'}|${BL.conv.loaded}`;
+        let index = convergenceIndexCache.get(cacheKey);
         if (!index) {
             index = new Map();
-
             for (const id of Object.keys(window.BattlePokedex || {})) {
                 const sp = dex.species.get(id);
-                if (!sp?.exists || sp.id !== id) continue;
-                if (sp.battleOnly || sp.isNonstandard) continue;
-                if (CONVERGENCE_EXCLUDED_DONORS.has(sp.id) || isBannedByList(convergenceBans, sp)) continue;
-
+                if (!sp?.exists || sp.id !== id || sp.gen > dex.gen) continue;
+                const allowedByRule = explicitlyAllowed.has(sp.id) ||
+                    !!bans?.unbanned?.has(sp.id) ||
+                    !!bans?.unbannedBase?.has(toID(sp.baseSpecies || sp.name));
+                if (megamons) {
+                    // Mega formes can be used as starting Pokémon. Normal
+                    // battle-only formes are also usable if available in Gen 9.
+                    // Never expose nonstandard historical formes unless unbanned.
+                    if (sp.isNonstandard && !allowedByRule &&
+                        !(fmtHas(String(format).split('@@@')[0], 'convergencemegamons') &&
+                          /mega/i.test(sp.forme || ''))) continue;
+                } else if (sp.battleOnly || sp.isNonstandard) continue;
+                if (CONVERGENCE_EXCLUDED_DONORS.has(sp.id)) continue;
+                // Explicit bans always take priority over the special form rule.
+                if (bannedIds.has(sp.id) || bannedBases.has(toID(sp.baseSpecies || sp.name))) {
+                    if (!allowedByRule) continue;
+                }
+                if (bans && isBannedByList(bans, sp)) continue;
                 const key = convergenceTypeKey(sp);
                 if (!index.has(key)) index.set(key, []);
                 index.get(key).push(sp);
             }
-
             for (const list of index.values()) list.sort((a, b) => a.name.localeCompare(b.name));
-            convergenceIndexCache.set(dex.gen, index);
+            convergenceIndexCache.set(cacheKey, index);
         }
-
         return index.get(convergenceTypeKey(species)) || [];
     }
 
     // moveId -> {donorId, header} across the whole typing group.
     function getConvergenceMoveMap(search, base, species) {
         // The inner providers shape each member's moves, so the stack is part of the key.
-        const key = `${search.dex.gen}|${convergenceTypeKey(species)}|${search.__qolStackKey}|${search.__qolNatdexMoves ? 1 : 0}`;
+        const activeFormat = getActiveTeambuilderRoom()?.curTeam?.format || search.format;
+        const key = `${search.dex.gen}|${activeFormat}|${convergenceTypeKey(species)}|${search.__qolStackKey}|${search.__qolNatdexMoves ? 1 : 0}`;
         let map = convergenceMoveCache.get(key);
         if (map) return map;
 
         map = new Map();
 
-        for (const member of getConvergenceGroup(search.dex, species)) {
+        for (const member of getConvergenceGroup(search.dex, species, getActiveTeambuilderRoom()?.curTeam?.format || search.format)) {
             const rows = withSearchSpecies(search, member.name, base);
             let header = null;
 
@@ -2020,9 +2128,12 @@
         const results = base();
         if (!search.species) return results;
 
-        if (!BL.conv.loaded) {
+        // Do not gate the entire Convergence provider on /tier. Some Showdown
+        // servers or clients never return a parseable response to the silent
+        // request. Build donors immediately, then refresh with legality when
+        // the banlist arrives.
+        if (!BL.conv.loaded && !isConvergenceMegamons(getActiveTeambuilderRoom()?.curTeam?.format || search.format)) {
             requestBanlist('conv');
-            return results;
         }
 
         const species = search.dex.species.get(search.species);
@@ -2054,9 +2165,12 @@
         const results = base();
         if (!search.species) return results;
 
-        if (!BL.conv.loaded) {
+        // Do not gate the entire Convergence provider on /tier. Some Showdown
+        // servers or clients never return a parseable response to the silent
+        // request. Build donors immediately, then refresh with legality when
+        // the banlist arrives.
+        if (!BL.conv.loaded && !isConvergenceMegamons(getActiveTeambuilderRoom()?.curTeam?.format || search.format)) {
             requestBanlist('conv');
-            return results;
         }
 
         const species = search.dex.species.get(search.species);
@@ -2064,13 +2178,13 @@
 
         const notes = results.filter((r) => r[0] === 'html');
         const own = results.filter((r) => r[0] === 'ability');
-        if (!own.length) return results;
-
+        // Custom-format searches can start with no native abilities. Convergence
+        // must still contribute the shared-typing ability pool.
         const seen = new Set(own.map((r) => r[1]));
         const donors = {};
         const extra = [];
 
-        for (const member of getConvergenceGroup(search.dex, species)) {
+        for (const member of getConvergenceGroup(search.dex, species, getActiveTeambuilderRoom()?.curTeam?.format || search.format)) {
             if (member.id === species.id) continue;
 
             for (const name of Object.values(member.abilities)) {
@@ -2086,7 +2200,7 @@
         extra.sort((a, b) => a[1].localeCompare(b[1]));
         addDonors(search, donors);
 
-        return [...notes, ['header', 'Converged Abilities'], ...own, ...extra];
+        return extra.length ? [...notes, ['header', 'Converged Abilities'], ...own, ...extra] : results;
     }
 
     // ====================================================================
@@ -2108,7 +2222,7 @@
         for (const id of Object.keys(window.BattleMovedex || {})) {
             const move = dex.moves.get(id);
             if (!move?.exists || move.id !== id) continue;
-            if (move.isNonstandard || move.isZ || move.isMax || id === 'struggle') continue;
+            if (move.isZ || move.isMax || move.isNonstandard === 'CAP') continue;
 
             const letter = move.name.charAt(0).toLowerCase();
             if (!/[a-z]/.test(letter)) continue;
@@ -2160,15 +2274,110 @@
 
     // Native learnset check OR Alphabet Cup letter rule (used by Pokémon search filters).
     function pokemonMatchesMove(ctx, original, row, species, moveId) {
-        if (original.call(ctx, row, [['move', moveId]])) return true;
+        return pokemonMatchesProvider(ctx, original, row, species, 'move', moveId);
+    }
+
+    // Use the same effective pools for Pokémon filters and the set editor.
+    // Keep native canLearn untouched: providers need it to identify genuine gains.
+    function pokemonMatchesProvider(ctx, original, row, species, kind, target) {
+        const providers = kind === 'move' ? MOVE_PROVIDERS : ABILITY_PROVIDERS;
         const mods = modsForSearch(ctx);
-        if (mods.includes(MOD.ALL_MOVES)) return getAlphabetCupCache(ctx.dex).ids.has(toID(moveId));
-        if (mods.includes(MOD.TYPEMONS) && ctx.__qolTypemons &&
-            getAlphabetCupCache(ctx.dex).ids.has(toID(moveId)) &&
-            ctx.dex.moves.get(moveId).type === ctx.__qolTypemons) {
-            return true;
+        if (!mods.some((mod) => providers[mod])) {
+            return original.call(ctx, row, [[kind, target]]);
         }
-        return mods.includes(MOD.ALPHABET_CUP) && alphabetCupCanLearn(ctx.dex, species, moveId);
+        const format = getActiveTeambuilderRoom()?.curTeam?.format || ctx.format;
+        const id = toID(target);
+        // Simple gains are membership queries, not requests to render every move
+        // or ability for every Pokémon in the dex.
+        const simpleMoves = [MOD.STABMONS, MOD.ALPHABET_CUP, MOD.ALL_MOVES, MOD.TYPEMONS];
+        const simpleAbilities = [MOD.ALMOST_ANY_ABILITY, MOD.MIX_AND_MEGA];
+        if (mods.every((mod) => !providers[mod] || (kind === 'move' ? simpleMoves : simpleAbilities).includes(mod))) {
+            const bans = ctx.__qolProviderBans === undefined ? getMergedBansForFormat(format) : ctx.__qolProviderBans;
+            const native = original.call(ctx, row, [[kind, target]]);
+            if (kind === 'ability') {
+                const nativeIds = Object.values(species.abilities || {}).map(toID);
+                if (abilityBanned(bans, id, nativeIds, isPokebilitiesFormat(format))) return false;
+                if (bans?.restrictedAbilities?.has(id) && !nativeIds.includes(id)) return false;
+                return native || (mods.includes(MOD.ALMOST_ANY_ABILITY) && allAbilityIds(ctx.dex).includes(id));
+            }
+            if (bans?.moves?.has(id)) return false;
+            if (native) return true;
+            if (bans?.restrictedMoves?.has(id)) return false;
+            if (mods.includes(MOD.STABMONS) && stabmonsCanLearn(ctx.dex, species, id, isNationalDexFormat(format))) return true;
+            if (mods.includes(MOD.ALPHABET_CUP) && alphabetCupCanLearn(ctx.dex, species, id)) return true;
+            return getAlphabetCupCache(ctx.dex).ids.has(id) &&
+                (mods.includes(MOD.ALL_MOVES) || (mods.includes(MOD.TYPEMONS) && ctx.__qolTypemons === ctx.dex.moves.get(id).type));
+        }
+        const Search = kind === 'move' ? window.BattleMoveSearch : window.BattleAbilitySearch;
+        const cache = ctx.__qolProviderPools || (ctx.__qolProviderPools = new Map());
+        const cacheKey = kind + ':' + species.id;
+        if (cache.has(cacheKey)) return cache.get(cacheKey).has(toID(target));
+        const room = getActiveTeambuilderRoom();
+        const set = room?.curSet?.species && toID(room.curSet.species) === species.id
+            ? {...room.curSet} : {species: species.name, name: '', item: '', ability: '', nature: '', moves: []};
+        const probe = new Search(kind, resolveFormatKey(String(format).split('@@@')[0]) || String(format).split('@@@')[0].trim(), set);
+        probe.__qolProviderMods = mods;
+        probe.dex = ctx.dex;
+        const rows = probe.getBaseResults();
+        const ids = new Set(rows.filter((r) => r[0] === kind &&
+            !(probe.__qolGroups || []).some((group) => group.kind === kind && group.test(r[1])))
+            .map((r) => r[1]));
+        cache.set(cacheKey, ids);
+        return ids.has(toID(target));
+    }
+
+    const stabmonsTypeCache = new WeakMap();
+    function stabmonsCanLearn(dex, species, id, natdex) {
+        const move = dex.moves.get(id);
+        if (!species?.exists || !species.name || !move?.exists || move.gen > dex.gen || move.isZ || move.isMax || move.isNonstandard === 'CAP') return false;
+        let cache = stabmonsTypeCache.get(dex);
+        if (!cache) stabmonsTypeCache.set(dex, cache = new Map());
+        const key = `${species.id}|${natdex}|${move.gen}`;
+        let types = cache.get(key);
+        if (!types) {
+            types = new Set();
+            const minGen = dex.gen === 9 && !natdex ? 9 : species.gen;
+            for (let gen = dex.gen; gen >= minGen && gen >= move.gen; gen--) {
+                const genDex = Dex.forGen(gen);
+                const mon = genDex.species.get(species.name);
+                if (!mon?.exists || !mon.name) continue;
+                const original = genDex.species.get(mon.changesFrom || mon.name);
+                for (const type of original.types || []) types.add(type);
+                const baseSpecies = genDex.species.get(mon.baseSpecies || mon.name);
+                for (const name of baseSpecies.otherFormes || []) {
+                    if (baseSpecies.prevo && genDex.species.get(baseSpecies.prevo).evos?.includes(name)) continue;
+                    const forme = genDex.species.get(name);
+                    if (forme.exists && !forme.battleOnly && forme.changesFrom === original.name) {
+                        for (const type of forme.types || []) types.add(type);
+                    }
+                }
+                const seen = new Set();
+                for (let prevo = mon.prevo; prevo && !seen.has(prevo);) {
+                    seen.add(prevo);
+                    const prior = genDex.species.get(prevo);
+                    for (const type of prior.types || []) types.add(type);
+                    prevo = prior.prevo;
+                }
+            }
+            cache.set(key, types);
+        }
+        const minGen = dex.gen === 9 && !natdex ? 9 : species.gen;
+        for (let gen = dex.gen; gen >= minGen && gen >= move.gen; gen--) {
+            if (types.has(Dex.forGen(gen).moves.get(id).type)) return true;
+        }
+        return false;
+    }
+
+    function stabmonsMoveResults(search, base) {
+        const results = base();
+        if (!search.species) return results;
+        const species = search.dex.species.get(search.species);
+        if (!species?.exists) return results;
+        const natdex = isNationalDexFormat(getActiveTeambuilderRoom()?.curTeam?.format || search.format);
+        const have = new Set(results.filter((r) => r[0] === 'move').map((r) => r[1]));
+        const additions = Object.keys(window.BattleMovedex || {}).filter((id) =>
+            !have.has(id) && stabmonsCanLearn(search.dex, species, id, natdex));
+        return addMovesToResults(search, results, species, additions);
     }
 
     function alphabetCupMoveResults(search, base) {
@@ -2589,7 +2798,9 @@
             ? new Set(nativeRows().filter((r) => r[0] === 'move').map((r) => r[1]))
             : new Set();
         const banned = (id) => !!bans.moves?.has(id);
-        const restricted = (id) => !banned(id) && !!bans.restrictedMoves?.has(id) && !native.has(id);
+        const restricted = (id) => !banned(id) && !!bans.restrictedMoves?.has(id) &&
+            !(modsForSearch(search).includes(MOD.STABMONS)
+                ? search.canLearn(toID(search.species), id) : native.has(id));
 
         search.__qolGroups = [
             {header: 'Restricted Moves', kind: 'move', test: restricted},
@@ -2741,6 +2952,7 @@
         [MOD.ALL_MOVES]: camoveMoveResults,
         [MOD.SKETCHMONS]: sketchmonsMoveResults,
         [MOD.TYPEMONS]: typemonsMoveResults,
+        [MOD.STABMONS]: stabmonsMoveResults,
     };
 
     function runProviderChain(providers, search, nativeBase) {
@@ -2771,7 +2983,27 @@
     function patchMoveSearchResults() {
         return patchMethod(window.BattleMoveSearch?.prototype, 'getBaseResults', '__qolMoveProvidersPatched', (original) =>
                            function () {
-            const nativeRows = () => augmentWithNatdexMoves(this, original.call(this));
+            // A Convergence provider temporarily changes `this.species` to read
+            // each same-typing donor's learnset. Caching one `native` result for
+            // the entire call silently reused the recipient's moves for every
+            // donor, even though abilities were correctly shared. Cache per
+            // species + format instead, without persisting across searches.
+            const nativeBySpecies = new Map();
+            const nativeRows = () => {
+                const format = this.format;
+                const key = `${this.species || ''}|${format}|${this.set?.name || ''}|${this.__qolNatdexMoves ? 1 : 0}`;
+                if (nativeBySpecies.has(key)) return nativeBySpecies.get(key);
+                // Our provider handles STABmons, including absent historical
+                // formes. Do not also run the client's unguarded STABmons loop.
+                if (modsForSearch(this).includes(MOD.STABMONS)) {
+                    this.format = format === 'staaabmons' ? 'qolstab' : format.replace(/stabmons/g, 'qolstab');
+                }
+                let rows;
+                try { rows = augmentWithNatdexMoves(this, original.call(this)); }
+                finally { this.format = format; }
+                nativeBySpecies.set(key, rows);
+                return rows;
+            };
             return moveBannedMovesToHeader(this, runProviderChain(MOVE_PROVIDERS, this, nativeRows), nativeRows);
         }
                           );
@@ -2784,7 +3016,8 @@
     function bustFusionCache(search) {
         if (!search.set) return;
         const mods = modsForSearch(search);
-        const parts = [];
+        const parts = [getActiveTeambuilderRoom()?.curTeam?.format || search.format || '', search.species || ''];
+        if (mods.includes(MOD.SKETCHMONS)) parts.push(...(search.set.moves || []));
         if (mods.some(isFusionMod)) parts.push(search.set.species || '', search.set.name || '', search.species || '');
         if (mods.includes(MOD.TYPEMONS)) parts.push('typemons', typemonsType(getActiveTeambuilderRoom(), search) || '');
         if (!parts.length) return;
@@ -3223,6 +3456,7 @@
         if (type === 'from') return !!crossEvolveView(search.dex, search.dex.species.get(target), species.id);
         if (CUSTOM_TOGGLE_FILTERS[type]) return pokemonMatchesCustomToggle(search, original, row, species, type);
         if (type === 'move') return pokemonMatchesMove(search, original, row, species, target);
+        if (type === 'ability') return pokemonMatchesProvider(search, original, row, species, type, target);
         // type / ability / egggroup / tier: reuse native logic
         return original.call(search, row, [[type, target]]);
     }
@@ -3389,6 +3623,26 @@
     }
 
     function patchPokemonSearchResults() {
+        patchMethod(window.BattlePokemonSearch?.prototype, 'getBaseResults', '__qolUnbannedPoolPatched', (original) =>
+            function () {
+                const rows = original.call(this);
+                const format = getActiveTeambuilderRoom()?.curTeam?.format || this.format;
+                const bans = getMergedBansForFormat(format);
+                const isMegaConv = isConvergenceMegamons(format);
+                const explicit = isMegaConv ? explicitlyUnbannedForms(format) : new Set();
+                if (!explicit.size && !bans?.unbanned?.size && !bans?.unbannedBase?.size) return rows;
+                const have = new Set(rows.filter((r) => r[0] === 'pokemon').map((r) => r[1]));
+                const extra = [];
+                for (const id of Object.keys(window.BattlePokedex || {})) {
+                    const sp = this.dex.species.get(id);
+                    if (!sp?.exists || have.has(id) || sp.gen > this.dex.gen) continue;
+                    if (explicit.has(id) || bans?.unbanned?.has(id) ||
+                        bans?.unbannedBase?.has(toID(sp.baseSpecies || sp.name))) {
+                        extra.push(['pokemon', id]);
+                    }
+                }
+                return extra.length ? [...rows, ['header', 'Explicitly unbanned'], ...extra] : rows;
+            });
         patchMethod(window.BattlePokemonSearch?.prototype, 'getTier', '__qolPoolTierPatched', (original) =>
             function (species) {
                 return this.__qolPokemonPool
@@ -3397,6 +3651,15 @@
         return patchMethod(window.BattlePokemonSearch?.prototype, 'getResults', '__qolPokemonResultsPatched', (original) =>
                            function (filters, sortCol, reverseSort) {
             if (this.searchType !== 'pokemon') return original.call(this, filters, sortCol, reverseSort);
+            const providerRoom = getActiveTeambuilderRoom();
+            const providerFormat = providerRoom?.curTeam?.format || this.format;
+            const providerKey = JSON.stringify([providerFormat, providerRoom?.curSet,
+                providerRoom?.curSetList?.map((set) => [set.species, set.moves])]);
+            if (this.__qolProviderKey !== providerKey) {
+                this.__qolProviderKey = providerKey;
+                this.__qolProviderPools = null;
+            }
+            this.__qolProviderBans = getMergedBansForFormat(providerFormat);
 
             // Remember the active into/from chips for sort().
             const findChip = (kind) => {
@@ -5079,10 +5342,13 @@
             set = set || this.curSet;
             if (!set) return 0;
 
+            const dex = this.curTeam?.dex;
+            // The outer stat-form/optimizer wrapper already provided modified
+            // baseStats. Recomputing here would double-apply BnB/Tier Shift.
+            if (isStatOverrideActive(dex, set.species)) return callOriginal();
             const mods = getActiveMods(this);
             if (!mods.length) return callOriginal();
 
-            const dex = this.curTeam?.dex;
             const baseStats = computeModsBaseStats(mods, {dex, set, room: this});
             if (!baseStats) return callOriginal();
 
@@ -5096,6 +5362,9 @@
         const mods = getActiveMods(room);
         const set = room?.curSet;
         if (!mods.length || !set?.species) return;
+        // Nested native graph renders will be followed by the outer form's
+        // final column update; never fold stats from a temporarily patched Dex.
+        if (isStatOverrideActive(room.curTeam?.dex, set.species)) return;
 
         const baseStats = computeModsBaseStats(mods, {dex: room.curTeam?.dex, set, room});
         if (!baseStats) return;
@@ -5106,12 +5375,47 @@
         STATS.forEach((stat, i) => rows.eq(i + 1).find('b').text(baseStats[stat]));
     }
 
+    // Supply the transformed species to native stat rendering/EV optimization,
+    // not just to the final base-stat column. Always restore the Dex lookup.
+    function withActiveModdedStatSpecies(room, fn) {
+        const set = room?.curSet;
+        const dex = room?.curTeam?.dex;
+        if (!set?.species || !dex?.species?.get) return fn();
+        if (isStatOverrideActive(dex, set.species)) return fn();
+        const mods = getActiveMods(room);
+        if (!mods.length) return fn();
+        const stats = computeModsBaseStats(mods, {dex, set, room});
+        return stats ? withSpeciesBaseStats(dex, set.species, stats, fn) : fn();
+    }
+
+    // The optimizer is distinct from BattleStatGuesser. Imported team formats
+    // (especially a name like "STAAABnB" without a gen prefix) are not Dex mod IDs.
+    // Keep the actual format on the team, and normalize only the native optimizer's
+    // constructor argument so its Dex.mod() call receives a supported generation.
+    function patchBattleStatOptimizerConstructor() {
+        const Optimizer = window.BattleStatOptimizer;
+        if (typeof Optimizer !== 'function') return false;
+        if (Optimizer.__qolFormatPatched) return true;
+        const Wrapped = new Proxy(Optimizer, {
+            construct(target, args, newTarget) {
+                if (typeof args[0] === 'string') {
+                    args = args.slice();
+                    args[0] = statGuesserFormat(args[0]);
+                }
+                return Reflect.construct(target, args, newTarget);
+            },
+        });
+        Wrapped.__qolFormatPatched = true;
+        window.BattleStatOptimizer = Wrapped;
+        return true;
+    }
+
     function patchStatForm() {
         const proto = window.TeambuilderRoom?.prototype;
 
         const updateForm = patchMethod(proto, 'updateStatForm', '__qolPatched', (original) =>
                                        function (setGuessed) {
-            const result = original.call(this, setGuessed);
+            const result = withActiveModdedStatSpecies(this, () => original.call(this, setGuessed));
 
             applyModBaseStatColumn(this);
             if (getActiveMods(this).includes(MOD.MIX_AND_MEGA) && this.curSet?.species) {
@@ -5125,13 +5429,40 @@
         const columnPatches = ['updateStatGraph', 'natureChange'].map((key) =>
                                                                       patchMethod(proto, key, '__qolBaseColumn_' + key, (original) =>
                                                                                   function (...args) {
-            const result = original.apply(this, args);
+            const result = withActiveModdedStatSpecies(this, () => original.apply(this, args));
             applyModBaseStatColumn(this);
             if (getActiveMods(this).includes(MOD.MIX_AND_MEGA) && this.curSet?.species) updateMixAndMegaSpeedNote(this);
             return result;
         }
                                                                                  )
                                                                      );
+
+        // Auto-EVs are determined before updateStatGraph; patch the guessing entry
+        // point too, otherwise EVs will lag until the set is reopened.
+        const guessPatches = ['setStatFormGuesses', 'checkStatOptimizations'].map((key) =>
+            typeof proto?.[key] !== 'function' || patchMethod(proto, key, '__qolModded_' + key,
+                (original) => function (...args) {
+                    const before = this.curSet && JSON.stringify([this.curSet.evs, this.curSet.nature]);
+                    const result = withActiveModdedStatSpecies(this, () => original.apply(this, args));
+                    const after = this.curSet && JSON.stringify([this.curSet.evs, this.curSet.nature]);
+                    // In some builds the auto-spread callback commits EVs after
+                    // rendering the stat panel. Only refresh when values changed;
+                    // do not recursively rerun the optimizer or mutate the set.
+                    if (before !== after && !this.__qolGuessRefreshPending) {
+                        const room = this, set = this.curSet;
+                        room.__qolGuessRefreshPending = true;
+                        requestAnimationFrame(() => {
+                            room.__qolGuessRefreshPending = false;
+                            if (room.curSet !== set || !room.curTeam) return;
+                            try {
+                                room.updateStatForm?.(false);
+                                room.updateStatGraph?.();
+                            } catch (e) { console.warn(LOG, 'EV graph refresh failed:', e); }
+                        });
+                    }
+                    return result;
+                })
+        );
 
         const statSlide = patchMethod(proto, 'statSlide', '__qolPatched', (original) =>
                                       function (...args) {
@@ -5141,7 +5472,7 @@
         }
                                      );
 
-        return updateForm && statSlide && columnPatches.every(Boolean);
+        return updateForm && statSlide && columnPatches.every(Boolean) && guessPatches.every(Boolean);
     }
 
     // The Details pane's type icons come from the *named* species with no
@@ -5429,13 +5760,45 @@
         MOD.FRANTIC_FUSIONS, MOD.NATURE_SWAP, MOD.REEVOLUTION,
     ]);
 
+    function statGuesserFormat(format) {
+        const base = String(format || '').split('@@@')[0].trim();
+        if (!base) return '';
+        const resolved = resolveFormatKey(base) || toID(base);
+        const team = getActiveTeambuilderRoom()?.curTeam;
+        const gen = Number(resolved.match(/^gen([1-9])(?!\d)/)?.[1] || team?.dex?.gen || team?.gen || Dex.gen || 9);
+        // Dex.mod expects an actual Dex generation/mod, not a challenge-code
+        // nickname (e.g. STAAABnB). Do not create a fake gen9staaabnb mod.
+        // The QOL stat wrappers independently supply modified base stats.
+        return /^gen[1-9](?!\d)/.test(resolved) ? resolved : `gen${gen}`;
+    }
+
+    // The native constructor passes the first four characters straight to
+    // Dex.mod. Give that consumer an ID, while preserving the imported code.
+    function patchBattleStatGuesserConstructor() {
+        const Guesser = window.BattleStatGuesser;
+        if (!Guesser) return false;
+        if (Guesser.__qolFormatPatched) return true;
+        const Wrapped = new Proxy(Guesser, {
+            construct(target, args, newTarget) {
+                const [format, ...rest] = args;
+                const guesser = Reflect.construct(target, [statGuesserFormat(format), ...rest], newTarget);
+                guesser.__qolChallengeFormat = format;
+                return guesser;
+            },
+        });
+        Wrapped.__qolFormatPatched = true;
+        window.BattleStatGuesser = Wrapped;
+        return true;
+    }
+
     function patchBattleStatGuesserGetStat() {
         return patchMethod(window.BattleStatGuesser?.prototype, 'getStat', '__qolBattlePatched', (original) =>
                            function (stat, set, evOverride, natureOverride) {
             const callOriginal = () => original.call(this, stat, set, evOverride, natureOverride);
             if (!set?.species || !this.dex?.species?.get) return callOriginal();
 
-            const mod = modFromFormat(this.formatid);
+            if (isStatOverrideActive(this.dex, set.species)) return callOriginal();
+            const mod = modFromFormat(this.__qolChallengeFormat || this.formatid);
             if (!BATTLE_GUESSER_MODS.has(mod)) return callOriginal();
 
             const baseStats = computeModBaseStats(mod, {dex: this.dex, set});
@@ -5452,6 +5815,7 @@
 
             const room = getTeambuilderRoom();
             if (!isGodlyGiftFormat(room) || !set?.species || !this.dex?.species?.get) return callOriginal();
+            if (isStatOverrideActive(this.dex, set.species)) return callOriginal();
 
             const baseStats = godlyGiftBaseStats(room, set);
             return baseStats ? withSpeciesBaseStats(this.dex, set.species, baseStats, callOriginal) : callOriginal();
@@ -5698,6 +6062,8 @@
         }
     }
 
+    // Shift details are attached to the original search result, not a second
+    // selectable result. Avoid mousemove (and the consequent rerender loop).
     const DOM_DECORATORS = [
         ['donor icons', decorateDonorIcons],
         ['move filter rows', decorateMoveFilterRows],
@@ -5758,6 +6124,7 @@
                                                         .map((definition) => [definition.id, definition.challengeRule]));
 
     function selfChallengeFormat(format) {
+        if (String(format || '').includes('@@@')) return format;
         const [base, ruleText = ''] = String(format || '').split('@@@');
         const baseMod = window.BattleFormats?.[base]?.mod;
         const gen = String(baseMod || base).match(/^gen(\d+)/i)?.[1] || String(base).match(/^gen(\d)/i)?.[1] || '9';
@@ -6361,7 +6728,7 @@
     function customFormatLabelKey(format) {
         const [base, rules] = String(format || '').split('@@@');
         if (!rules) return '';
-        return `${base.trim()}@@@${rules.split(',').map(squash).filter(Boolean).join(',')}`;
+        return String(format).trim();
     }
     function getCustomFormatLabels() {
         try {
@@ -6675,14 +7042,14 @@
                 formatButton.value = baseKey;
                 formatButton.dispatchEvent(new Event('change', {bubbles: true}));
             }
-            applyTeamFormat(room, baseKey, ruleText.split(',').map(squash).filter(Boolean), entry.label || '');
+            applyTeamFormat(room, baseKey, ruleText.split(',').map(squash).filter(Boolean), entry.label || '', entry.format);
             window.app?.closePopup?.();
         }, true);
     }
 
     // -> {base, rules} or {error}
     function parseFormatImport(text, {currentFormat = ''} = {}) {
-        const s = String(text || '').replace(/\r/g, '').trim().replace(/^\/\w+\s+/, ''); // drop "/challenge "
+        const s = String(text || '').trim().replace(/^\/(?:challenge|chall|utm)\s+/i, '');
         if (!s) return {error: 'Paste a format first.'};
 
         const at = s.indexOf('@@@');
@@ -6691,7 +7058,7 @@
         if (at >= 0) {
             baseText = s.slice(0, at);
             ruleText = s.slice(at + 3);
-        } else if (resolveFormatKey(squash(s))) {
+        } else if (resolveFormatKey(squash(s.slice(s.lastIndexOf(',') + 1))) || /^\s*(?:\[Gen\s*\d+\]|gen\d+)/i.test(s)) {
             baseText = s;
         } else {
             ruleText = s; // just rules: keep the team's current base format
@@ -6701,29 +7068,33 @@
         if (baseText.includes(',')) baseText = baseText.slice(baseText.lastIndexOf(',') + 1);
         baseText = squash(baseText);
 
-        const base = baseText ? resolveFormatKey(baseText) : String(currentFormat).split('@@@')[0];
+        const base = baseText ? resolveFormatKey(baseText) || baseText : String(currentFormat).split('@@@')[0];
         if (!base) return {error: baseText ? `Unknown format "${baseText}".` : 'Open a team first, or include a format name.'};
 
-        const seen = new Set();
-        const rules = ruleText.split(',').map(squash).filter((t) => {
-            const id = t.toLowerCase();
-            if (!t || seen.has(id)) return false;
-            seen.add(id);
-            return true;
-        });
-        return {base, rules};
+        // Keep the submitted payload verbatim; normalized tokens are only for analysis.
+        const rules = ruleText.split(',').map((t) => t.trim()).filter(Boolean);
+        const payload = at >= 0 ? s.slice(s.slice(0, at).lastIndexOf(',') + 1).trim()
+            : baseText ? s.slice(s.lastIndexOf(',') + 1).trim() : base + '@@@' + ruleText;
+        return {base, rules, format: payload};
     }
 
     // Puts `base@@@rules` on the open team (keeps the generation / dex in step).
-    function applyTeamFormat(room, base, rules, customName = '') {
+    function applyTeamFormat(room, base, rules, customName = '', rawFormat = null) {
         const team = room?.curTeam;
         if (!team) return false;
 
         const oldGen = String(team.format || '').match(/^gen(\d+)/)?.[1];
         const newGen = String(base).match(/^gen(\d+)/)?.[1];
 
-        team.format = rules.length ? base + '@@@' + rules.join(',') : base;
+        const nextFormat = String(rawFormat ?? (rules.length ? base + '@@@' + rules.join(',') : base)).trim();
+        const formatChanged = team.format !== nextFormat;
+        team.format = nextFormat;
         if (rules.length && customName) saveCustomFormatLabel(team.format, customName);
+        if (!formatChanged) {
+            // A name change should not reset the editor or duplicate its rows.
+            decorateCustomFormatNames();
+            return true;
+        }
         if (newGen && newGen !== oldGen) {
             team.gen = Number(newGen);
             if (typeof Dex.forGen === 'function') team.dex = Dex.forGen(team.gen);
@@ -6740,9 +7111,7 @@
         const parsed = parseFormatImport(text, {currentFormat: room.curTeam.format});
         if (parsed.error) return {error: parsed.error};
         const label = squash(customName);
-        if (parsed.rules.length && !label) return {error: 'Enter a name for this custom format.'};
-
-        applyTeamFormat(room, parsed.base, parsed.rules, label);
+        applyTeamFormat(room, parsed.base, parsed.rules, label, parsed.format);
 
         const count = (sign) => parsed.rules.filter((t) => t[0] === sign).length;
         return {
@@ -6795,7 +7164,7 @@
 
                 const current = String(team.format || '');
                 const hasRules = current.includes('@@@');
-                const value = text ?? (hasRules ? current.replace('@@@', ' @@@ ').replace(/,/g, ', ') : '');
+                const value = text ?? (hasRules ? current : '');
                 const nameValue = customName ?? getCustomFormatLabel(current);
 
                 this.$el.html(wrap(
@@ -7202,7 +7571,19 @@
     function decorateCustomFormatDropdown() {
         if (IS_DAMAGE_CALC) return;
         const popup = document.querySelector('.ps-popup');
-        if (!popup || popup.querySelector('.qol-custom-formats')) return;
+        if (!popup) return;
+        // Native popup re-renders can keep a stale injected section. Rebuild
+        // only when its set of formats changes, removing stale duplicates.
+        const existing = [...popup.querySelectorAll('.qol-custom-formats')];
+        const signature = savedCustomFormats().join('\n');
+        if (existing.length === 1 && existing[0].dataset.qolSignature === signature) return;
+        existing.forEach((section) => {
+            let next = section.nextElementSibling;
+            for (let i = 0; i < 2 && next?.tagName === 'P' && !next.textContent.trim(); i++) {
+                const remove = next; next = next.nextElementSibling; remove.remove();
+            }
+            section.remove();
+        });
 
         const sections = [...popup.querySelectorAll('details[section]')];
         if (!sections.length || !popup.querySelector(FORMAT_BTN)) return;
@@ -7217,6 +7598,7 @@
 
         const details = document.createElement('details');
         details.className = 'qol-custom-formats';
+        details.dataset.qolSignature = signature;
         details.setAttribute('section', 'Custom Formats');
         details.open = true;
 
@@ -9698,6 +10080,7 @@
             // teambuilder: stats, icons, chooser
             patchMonocolorAddPokemon(),
             patchGetStat(),
+            patchBattleStatOptimizerConstructor(),
             patchStatForm(),
             patchRenderSetTypeIcons(),
             patchChartSet(),
@@ -9705,6 +10088,7 @@
             patchMoveSortRowUi(),
 
             // battle
+            patchBattleStatGuesserConstructor(),
             patchBattleStatGuesserGetStat(),
             patchBattleStatGuesserGuess(),
             patchTooltipSpeedRange(),
