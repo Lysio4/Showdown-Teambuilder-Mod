@@ -2,7 +2,7 @@
 // @name         Pokémon Showdown Teambuilder QOL
 // @author       jl
 // @namespace    https://github.com/Jake18236/showdown-teambuilder-mod
-// @version      16.0.1
+// @version      17.0.0
 // @description  Adds Teambuilder and damage calculator support for some OMs
 // @match        https://play.pokemonshowdown.com/*
 // @match        https://smogtours.psim.us/*
@@ -266,6 +266,7 @@
             for (const rule of rules.split(',')) {
                 const token = rule.trim();
                 if (!token) continue;
+                if (/^convergence(?:\s+legality|mod)?$/i.test(token)) add(MOD.CONVERGENCE);
 
                 // Removing a restriction means what it says: "!Obtainable Abilities" = any ability is
                 // legal (AAA), "!Obtainable Moves" = any move is legal, "!Obtainable" = both.
@@ -656,7 +657,38 @@
     // is requested here: getMergedBans() asks the server once per format.
     const isGodlyGiftFormat = (room) => fmtHas(room?.curTeam?.format, 'godlygift');
     const isTierShiftAAAFormat = (room) => formatActive(room, 'tiershiftaaa', 'tsa');
-    const isConvergenceFormat = (room) => formatActive(room, 'convergence', 'conv');
+    // The Convergence Megamons challenge code is based on Anything Goes and adds
+    // Convergence Legality, !Obtainable Formes and individual +Mega entries.
+    // It is NOT Mix and Mega: the Mega formes are starting species, not stone effects.
+    // Keep the same path for the eventual standalone Showdown format.
+    function isConvergenceMegamons(format) {
+        const name = String(format || '').split('@@@')[0];
+        if (fmtHas(name, 'convergencemegamons', 'megamonsconvergence')) return true;
+        const rules = String(format || '').split('@@@').slice(1).join('@@@');
+        return /(?:^|,)\s*convergence legality\s*(?:,|$)/i.test(rules) &&
+            (/(?:^|,)\s*!\s*obtainable formes\s*(?:,|$)/i.test(rules) ||
+             /(?:^|,)\s*\+[a-z0-9-]+-mega(?:-[xyz])?\s*(?:,|$)/i.test(rules));
+    }
+
+    function isConvergenceEnabled(format) {
+        return fmtHas(format, 'convergence') || isConvergenceMegamons(format);
+    }
+
+    function explicitlyUnbannedForms(format) {
+        const rules = String(format || '').split('@@@').slice(1).join('@@@');
+        const ids = new Set();
+        for (const token of rules.split(',')) {
+            const match = /^\s*\+\s*(.+?)\s*$/.exec(token);
+            if (match) ids.add(toID(match[1]));
+        }
+        return ids;
+    }
+
+    const isConvergenceFormat = (room) => {
+        const format = room?.curTeam?.format;
+        if (isConvergenceMegamons(format)) return true;
+        return formatActive(room, 'convergence', 'conv');
+    };
 
     // ---------- parsing ----------
 
@@ -902,7 +934,7 @@
         // Convergence has a named list of its own, but is excluded from the
         // generic /tier cache. Keep its bans available to the ability search
         // decorator as well as the movepool provider.
-        if (fmtHas(format, 'convergence') && convergenceBans) {
+        if (!isConvergenceMegamons(format) && fmtHas(format, 'convergence') && convergenceBans) {
             const rules = String(format).split('@@@')[1] || '';
             if (!rules.trim()) return convergenceBans;
             const tokens = rules.split(',').map((t) => t.replace(/\s+/g, ' ').trim()).filter(Boolean);
@@ -955,8 +987,8 @@
     }
 
     function parseConvergenceBanlist(html) {
-        const sections = parseFormatSectionTokens(html, '[Gen 9] Convergence');
-        if (!sections) return false;
+        const sections = parseFormatSectionTokens(html, null);
+        if (!sections || !Object.keys(sections).length) return false;
 
         convergenceBans = parseBanSections(sections);
         BL.conv.loaded = true;
@@ -1069,6 +1101,10 @@
         for (const tier of inferredTierBans(formatId).tiers) entry.bans.tiers.add(tier);
         entry.merged = null;
         entry.loaded = true;
+        if (isConvergenceMegamons(getActiveTeambuilderRoom()?.curTeam?.format) || isConvergenceMegamons(formatId)) {
+            convergenceIndexCache.clear();
+            convergenceMoveCache.clear();
+        }
         console.log(LOG, `Loaded bans for ${title}`);
 
 
@@ -2019,41 +2055,61 @@
         return types.join('/');
     }
 
-    // Every legal donor species sharing a typing, cached per generation.
-    function getConvergenceGroup(dex, species) {
-        let index = convergenceIndexCache.get(dex.gen);
-
+    // Do not cache Convergence donors globally by generation: the mega-enabled
+    // challenge code, the future named format, and ordinary Convergence each have
+    // different legal pools. Parse local explicit unbans immediately, even while
+    // the /formathelp reply is in flight.
+    function getConvergenceGroup(dex, species, format) {
+        const megamons = isConvergenceMegamons(format);
+        const explicitlyAllowed = megamons ? explicitlyUnbannedForms(format) : new Set();
+        const bans = megamons ? getMergedBansForFormat(format) : convergenceBans;
+        const bannedIds = bans?.species || new Set();
+        const bannedBases = bans?.baseSpecies || new Set();
+        const cacheKey = `${dex.gen}|${String(format || 'gen9convergence')}|${megamons ? 'mega' : 'normal'}|${BL.conv.loaded}`;
+        let index = convergenceIndexCache.get(cacheKey);
         if (!index) {
             index = new Map();
-
             for (const id of Object.keys(window.BattlePokedex || {})) {
                 const sp = dex.species.get(id);
-                if (!sp?.exists || sp.id !== id) continue;
-                if (sp.battleOnly || sp.isNonstandard) continue;
-                if (CONVERGENCE_EXCLUDED_DONORS.has(sp.id) || isBannedByList(convergenceBans, sp)) continue;
-
+                if (!sp?.exists || sp.id !== id || sp.gen > dex.gen) continue;
+                const allowedByRule = explicitlyAllowed.has(sp.id) ||
+                    !!bans?.unbanned?.has(sp.id) ||
+                    !!bans?.unbannedBase?.has(toID(sp.baseSpecies || sp.name));
+                if (megamons) {
+                    // Mega formes can be used as starting Pokémon. Normal
+                    // battle-only formes are also usable if available in Gen 9.
+                    // Never expose nonstandard historical formes unless unbanned.
+                    if (sp.isNonstandard && !allowedByRule &&
+                        !(fmtHas(String(format).split('@@@')[0], 'convergencemegamons') &&
+                          /mega/i.test(sp.forme || ''))) continue;
+                } else if (sp.battleOnly || sp.isNonstandard) continue;
+                if (CONVERGENCE_EXCLUDED_DONORS.has(sp.id)) continue;
+                // Explicit bans always take priority over the special form rule.
+                if (bannedIds.has(sp.id) || bannedBases.has(toID(sp.baseSpecies || sp.name))) {
+                    if (!allowedByRule) continue;
+                }
+                if (bans && isBannedByList(bans, sp)) continue;
                 const key = convergenceTypeKey(sp);
                 if (!index.has(key)) index.set(key, []);
                 index.get(key).push(sp);
             }
-
             for (const list of index.values()) list.sort((a, b) => a.name.localeCompare(b.name));
-            convergenceIndexCache.set(dex.gen, index);
+            convergenceIndexCache.set(cacheKey, index);
         }
-
         return index.get(convergenceTypeKey(species)) || [];
     }
 
     // moveId -> {donorId, header} across the whole typing group.
     function getConvergenceMoveMap(search, base, species) {
         // The inner providers shape each member's moves, so the stack is part of the key.
-        const key = `${search.dex.gen}|${convergenceTypeKey(species)}|${search.__qolStackKey}|${search.__qolNatdexMoves ? 1 : 0}`;
+        const activeFormat = getActiveTeambuilderRoom()?.curTeam?.format || search.format;
+        const key = `${search.dex.gen}|${activeFormat}|${convergenceTypeKey(species)}|${search.__qolStackKey}|${search.__qolNatdexMoves ? 1 : 0}`;
         let map = convergenceMoveCache.get(key);
         if (map) return map;
 
         map = new Map();
 
-        for (const member of getConvergenceGroup(search.dex, species)) {
+        for (const member of getConvergenceGroup(search.dex, species, getActiveTeambuilderRoom()?.curTeam?.format || search.format)) {
             const rows = withSearchSpecies(search, member.name, base);
             let header = null;
 
@@ -2072,9 +2128,12 @@
         const results = base();
         if (!search.species) return results;
 
-        if (!BL.conv.loaded) {
+        // Do not gate the entire Convergence provider on /tier. Some Showdown
+        // servers or clients never return a parseable response to the silent
+        // request. Build donors immediately, then refresh with legality when
+        // the banlist arrives.
+        if (!BL.conv.loaded && !isConvergenceMegamons(getActiveTeambuilderRoom()?.curTeam?.format || search.format)) {
             requestBanlist('conv');
-            return results;
         }
 
         const species = search.dex.species.get(search.species);
@@ -2106,9 +2165,12 @@
         const results = base();
         if (!search.species) return results;
 
-        if (!BL.conv.loaded) {
+        // Do not gate the entire Convergence provider on /tier. Some Showdown
+        // servers or clients never return a parseable response to the silent
+        // request. Build donors immediately, then refresh with legality when
+        // the banlist arrives.
+        if (!BL.conv.loaded && !isConvergenceMegamons(getActiveTeambuilderRoom()?.curTeam?.format || search.format)) {
             requestBanlist('conv');
-            return results;
         }
 
         const species = search.dex.species.get(search.species);
@@ -2116,13 +2178,13 @@
 
         const notes = results.filter((r) => r[0] === 'html');
         const own = results.filter((r) => r[0] === 'ability');
-        if (!own.length) return results;
-
+        // Custom-format searches can start with no native abilities. Convergence
+        // must still contribute the shared-typing ability pool.
         const seen = new Set(own.map((r) => r[1]));
         const donors = {};
         const extra = [];
 
-        for (const member of getConvergenceGroup(search.dex, species)) {
+        for (const member of getConvergenceGroup(search.dex, species, getActiveTeambuilderRoom()?.curTeam?.format || search.format)) {
             if (member.id === species.id) continue;
 
             for (const name of Object.values(member.abilities)) {
@@ -2138,7 +2200,7 @@
         extra.sort((a, b) => a[1].localeCompare(b[1]));
         addDonors(search, donors);
 
-        return [...notes, ['header', 'Converged Abilities'], ...own, ...extra];
+        return extra.length ? [...notes, ['header', 'Converged Abilities'], ...own, ...extra] : results;
     }
 
     // ====================================================================
@@ -2921,18 +2983,26 @@
     function patchMoveSearchResults() {
         return patchMethod(window.BattleMoveSearch?.prototype, 'getBaseResults', '__qolMoveProvidersPatched', (original) =>
                            function () {
-            let native;
+            // A Convergence provider temporarily changes `this.species` to read
+            // each same-typing donor's learnset. Caching one `native` result for
+            // the entire call silently reused the recipient's moves for every
+            // donor, even though abilities were correctly shared. Cache per
+            // species + format instead, without persisting across searches.
+            const nativeBySpecies = new Map();
             const nativeRows = () => {
-                if (native) return native;
                 const format = this.format;
+                const key = `${this.species || ''}|${format}|${this.set?.name || ''}|${this.__qolNatdexMoves ? 1 : 0}`;
+                if (nativeBySpecies.has(key)) return nativeBySpecies.get(key);
                 // Our provider handles STABmons, including absent historical
                 // formes. Do not also run the client's unguarded STABmons loop.
                 if (modsForSearch(this).includes(MOD.STABMONS)) {
                     this.format = format === 'staaabmons' ? 'qolstab' : format.replace(/stabmons/g, 'qolstab');
                 }
-                try { native = augmentWithNatdexMoves(this, original.call(this)); }
+                let rows;
+                try { rows = augmentWithNatdexMoves(this, original.call(this)); }
                 finally { this.format = format; }
-                return native;
+                nativeBySpecies.set(key, rows);
+                return rows;
             };
             return moveBannedMovesToHeader(this, runProviderChain(MOVE_PROVIDERS, this, nativeRows), nativeRows);
         }
@@ -3556,14 +3626,18 @@
         patchMethod(window.BattlePokemonSearch?.prototype, 'getBaseResults', '__qolUnbannedPoolPatched', (original) =>
             function () {
                 const rows = original.call(this);
-                const bans = getMergedBansForFormat(getActiveTeambuilderRoom()?.curTeam?.format || this.format);
-                if (!bans?.unbanned.size && !bans?.unbannedBase.size) return rows;
+                const format = getActiveTeambuilderRoom()?.curTeam?.format || this.format;
+                const bans = getMergedBansForFormat(format);
+                const isMegaConv = isConvergenceMegamons(format);
+                const explicit = isMegaConv ? explicitlyUnbannedForms(format) : new Set();
+                if (!explicit.size && !bans?.unbanned?.size && !bans?.unbannedBase?.size) return rows;
                 const have = new Set(rows.filter((r) => r[0] === 'pokemon').map((r) => r[1]));
                 const extra = [];
                 for (const id of Object.keys(window.BattlePokedex || {})) {
                     const sp = this.dex.species.get(id);
                     if (!sp?.exists || have.has(id) || sp.gen > this.dex.gen) continue;
-                    if (bans.unbanned.has(id) || bans.unbannedBase.has(toID(sp.baseSpecies || sp.name))) {
+                    if (explicit.has(id) || bans?.unbanned?.has(id) ||
+                        bans?.unbannedBase?.has(toID(sp.baseSpecies || sp.name))) {
                         extra.push(['pokemon', id]);
                     }
                 }
