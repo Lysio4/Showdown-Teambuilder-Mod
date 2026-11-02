@@ -2,7 +2,7 @@
 // @name         Pokémon Showdown Teambuilder QOL
 // @author       jl
 // @namespace    https://github.com/Jake18236/showdown-teambuilder-mod
-// @version      17.0.0
+// @version      18.0.0
 // @description  Adds Teambuilder and damage calculator support for some OMs
 // @match        https://showdown.lysio.ovh/*
 // @match        https://smogtours.psim.us/*
@@ -63,6 +63,7 @@
         THREE_FIFTY_CUP: 'threeFiftyCup',
         NATURE_SWAP: 'natureSwap',
         CAMOMONS: 'camomons',
+        BONUS_TYPE: 'bonusType',
         FORTEMONS: 'fortemons',
         SKETCHMONS: 'sketchmons',
         TYPEMONS: 'typemons',
@@ -83,10 +84,237 @@
     };
     const stripGen = (id) => String(id || '').replace(/^gen\d+/, '');
 
+    // Complete challenge-rule catalog supplied with this version. Presence here means
+    // we can parse/name the rule; simulator-only hooks continue to run server-side.
+    const SHOWDOWN_RULE_NAMES = Object.freeze([
+"Standard AG",
+"Standard",
+"Standard NEXT",
+"Flat Rules",
+"Limit Two Restricted",
+"Limit One Restricted",
+"Standard Doubles",
+"Standard OMs",
+"Standard NatDex",
+"NatDex Mod",
+"Standard Draft",
+"Obtainable",
+"Obtainable Moves",
+"Obtainable Abilities",
+"Obtainable Formes",
+"Obtainable Misc",
+"Hoenn Pokedex",
+"Sinnoh Pokedex",
+"Old Unova Pokedex",
+"New Unova Pokedex",
+"Kalos Pokedex",
+"Old Alola Pokedex",
+"New Alola Pokedex",
+"Galar Pokedex",
+"Isle of Armor Pokedex",
+"Crown Tundra Pokedex",
+"Galar Expansion Pokedex",
+"Paldea Pokedex",
+"Kitakami Pokedex",
+"Blueberry Pokedex",
+"PotD",
+"Team Preview",
+"Tera Type Preview",
+"One vs One",
+"Two vs Two",
+"Little Cup",
+"DC Timer",
+"DC Timer Bank",
+"Timeout Auto Choose",
+"Timer Accelerate",
+"Blitz",
+"VGC Timer",
+"Species Clause",
+"Nickname Clause",
+"Beat Up Nicknames Mod",
+"OHKO Clause",
+"Evasion Clause",
+"Evasion Abilities Clause",
+"Evasion Items Clause",
+"Evasion Moves Clause",
+"Accuracy Moves Clause",
+"Accuracy Trap Clause",
+"Sleep Moves Clause",
+"Gravity Sleep Clause",
+"Endless Battle Clause",
+"DryPass Clause",
+"Baton Pass Clause",
+"One Baton Pass Clause",
+"One Boost Passer Clause",
+"Baton Pass Stat Clause",
+"Speed Pass Clause",
+"Baton Pass Trap Clause",
+"Baton Pass Stat Trap Clause",
+"CFZ Clause",
+"Z-Move Clause",
+"Not Fully Evolved",
+"HP Percentage Mod",
+"Exact HP Mod",
+"Cancel Mod",
+"Sleep Clause Mod",
+"Stadium Sleep Clause",
+"Switch Priority Clause Mod",
+"Desync Clause Mod",
+"Deoxys Camouflage Clause Mod",
+"Freeze Clause Mod",
+"No Freeze Mod",
+"Same Type Clause",
+"Enforce Same Tera Type",
+"Same Color Clause",
+"Same Letter Clause",
+"Mega Rayquaza Clause",
+"Dynamax Clause",
+"Terastal Clause",
+"Full Arceus Clause",
+"Inverse Mod",
+"OM Unobtainable Moves",
+"STABmons Move Legality",
+"Alphabet Cup Move Legality",
+"Sketchmons Move Legality",
+"Camomons Mod",
+"Allow Tradeback",
+"LGPE Normal Rules",
+"NFE Clause",
+"Gems Clause",
+"Sketch Post-Gen 7 Moves",
+"Mimic Glitch Clause",
+"Pomeg Glitch Clause",
+"Overflow Stat Mod",
+"Forme Clause",
+"350 Cup Mod",
+"Flipped Mod",
+"Scalemons Mod",
+"Team Type Preview",
+"Open Team Sheets",
+"Force Open Team Sheets",
+"AAA Restricted Abilities",
+"Event Moves Clause",
+"Stadium Items Clause",
+"NC 2000 Move Legality",
+"APT Clause",
+"NC 1997 Move Legality",
+"Stadium Poke Cup Rentals",
+"No Switching",
+"Guaranteed Secondary Mod",
+"Chimera 1v1 Rule",
+"Bonus Type Mod",
+"First Blood Rule",
+"Tier Shift Mod",
+"Revelationmons Mod",
+"Re-Evolution Mod",
+"Broken Record Mod",
+"Force of the Fallen Mod",
+"Category Swap Mod",
+"Godly Gift Mod",
+"VoltTurn Mayhem Mod",
+"Convergence Legality",
+"Hackmons Forme Legality",
+"Species Reveal Clause",
+"Frantic Fusions Mod",
+"Protean Palace Mod",
+"Illusion Level Mod",
+"Fervent Impersonation Mod",
+"Twisted Dimension Mod",
+"Mix and Mega Old Aggronite",
+"Bad 'n Boosted Mod",
+"Data Preview",
+"Rebalance Levels"
+]);
+    const SHOWDOWN_VALUE_RULE_NAMES = Object.freeze([
+"Force Monotype",
+"Force Monocolor",
+"Force Tera Type",
+"Force Select",
+"EV Limits",
+"Timer Starting",
+"Timer Grace",
+"Timer Add Per Turn",
+"Timer Max Per Turn",
+"Timer Max First Turn",
+"Item Clause",
+"Ability Clause",
+"Min Source Gen",
+"Picked Team Size",
+"Min Team Size",
+"EV Limit",
+"Max Team Size",
+"Max Move Count",
+"Max Total Level",
+"Min Level",
+"Max Level",
+"Default Level",
+"Adjust Level",
+"Adjust Level Down",
+"Best Of",
+"Allowed Pokemoves",
+"Unique Pokemoves"
+]);
+    const RULE_CATALOG = new Map([...SHOWDOWN_RULE_NAMES, ...SHOWDOWN_VALUE_RULE_NAMES]
+        .map((name) => [toSearchId(name), {name, valueRule: SHOWDOWN_VALUE_RULE_NAMES.includes(name)}]));
+    const formatGeneration = (format, fallback = null) => {
+        const base = String(format || '').split('@@@')[0].trim();
+        const match = /^(?:\[\s*gen\s*(\d+)\s*\]|gen\s*(\d+)(?=[^0-9]|$))/i.exec(base);
+        return match ? Number(match[1] || match[2]) : fallback;
+    };
+    // Return structured tokens: never confuse a removal (!Rule), replacement
+    // (!!Value Rule = x), ban (-X), or unban (+X) with an added game mod.
+    function parseChallengeRule(token) {
+        const raw = String(token || '').trim();
+        if (!raw) return null;
+        const match = /^(!!|!|\+|-|\*)\s*(.*)$/.exec(raw);
+        const sign = match ? match[1] : '';
+        const text = (match ? match[2] : raw).trim();
+        const eq = /^([^=]+?)(?:\s*=\s*(.*))?$/.exec(text);
+        const name = eq?.[1]?.trim() || text;
+        const value = eq?.[2] === undefined ? null : eq[2].trim();
+        const id = toSearchId(name);
+        const known = RULE_CATALOG.get(id) || null;
+        const fromFormat = window.BattleFormats?.[id] || null;
+        const kind = sign === '-' ? 'ban' : sign === '+' ? 'unban' : sign === '*' ? 'restrict'
+            : sign === '!' ? 'remove' : sign === '!!' ? 'replace' : value !== null ? 'value' : 'rule';
+        return {raw, sign, kind, name: known?.name || name, id, value,
+            known: !!known || !!fromFormat || !!MOD_DEFINITIONS.find((d) =>
+                d.challengeRule && toSearchId(d.challengeRule) === id),
+            valueRule: !!known?.valueRule};
+    }
+    function formatRuleTokens(format) {
+        return String(format || '').split('@@@').slice(1).join('@@@')
+            .split(',').map(parseChallengeRule).filter(Boolean);
+    }
+    // Effective *explicit* custom rules in input order (base-format inherited
+    // clauses are handled by the server). Last explicit action wins.
+    function explicitRuleState(format) {
+        const active = new Map();
+        const removed = new Set();
+        const operations = formatRuleTokens(format);
+        for (const op of operations) {
+            if (op.kind === 'remove') {active.delete(op.id); removed.add(op.id);}
+            else if (op.kind === 'rule' || op.kind === 'value' || op.kind === 'replace') {
+                active.set(op.id, op); removed.delete(op.id);
+            }
+        }
+        return {active, removed, operations};
+    }
+
+
     // Order matters: first match wins.
 
-    const isNationalDexFormat = (format) =>
-    fmtHas(format, 'nationaldex', 'natdex');
+    const isNationalDexFormat = (format) => {
+        const base = String(format || '').split('@@@')[0];
+        let enabled = fmtHas(base, 'nationaldex', 'natdex');
+        for (const op of formatRuleTokens(format)) {
+            if (op.id === 'natdexmod' || op.id === 'standardnatdex') {
+                if (op.kind === 'remove') enabled = false;
+                else if (['rule', 'replace'].includes(op.kind)) enabled = true;
+            }
+        }
+        return enabled;
+    };
 
     const isNationalDexMixAndMegaFormat = (format) =>
     isNationalDexFormat(format) && fmtHas(format, 'mixandmega');
@@ -111,7 +339,7 @@
             modifySpeciesPriority: 2,
             calcOm: 'badnboosted',
         },
-        {id: MOD.GODLY_GIFT, label: 'Godly Gift', modifySpeciesPriority: 3},
+        {id: MOD.GODLY_GIFT, formatKeywords: ['godlygift'], label: 'Godly Gift', challengeRule: 'godlygiftmod', modifySpeciesPriority: 3},
         {
             id: MOD.CROSS_EVOLUTION, formatKeywords: ['crossevolution'],
             label: 'Cross Evolution', challengeRule: 'crossevolutionmod', exclusiveGroup: 'fusion',
@@ -160,9 +388,10 @@
             id: MOD.SKETCHMONS, formatKeywords: ['sketchmons'],
             label: 'Sketchmons', challengeRule: 'sketchmonsmod',
         },
+        {id: MOD.BONUS_TYPE, formatKeywords: ['bonustype'], label: 'Bonus Type', challengeRule: 'Bonus Type Mod'},
         {id: MOD.TYPEMONS, providerKeywords: ['typemons'], label: 'Typemons'},
         {id: MOD.STABMONS, providerKeywords: ['stabmons', 'staaab'], label: 'STABmons', challengeRule: 'STABmons Move Legality'},
-        {id: MOD.CONVERGENCE, providerKeywords: ['convergence'], label: 'Convergence'},
+        {id: MOD.CONVERGENCE, providerKeywords: ['convergence'], label: 'Convergence', challengeRule: 'Convergence Legality'},
         {id: MOD.ALPHABET_CUP, providerKeywords: ['alphabetcup'], label: 'Alphabet Cup'},
         {id: MOD.ALL_MOVES, providerKeywords: ['camove'], label: 'Every Move'},
         {
@@ -248,34 +477,46 @@
     // Mods a format string turns on by itself: its own mod, provider mods, and "@@@" rule mods.
     function modsFromFormatString(format) {
         const mods = [];
-        const add = (mod) => { if (mod && !mods.includes(mod)) mods.push(mod); };
-        const fromText = (text) => {
+        const add = (mod) => {if (mod && !mods.includes(mod)) mods.push(mod);};
+        const remove = (mod) => {const idx = mods.indexOf(mod); if (idx >= 0) mods.splice(idx, 1);};
+        const matchBase = (text) => {
             add(modFromFormat(text));
             const id = fmtId(text);
-            for (const [keyword, mod] of FORMAT_PROVIDER_KEYWORDS) {
-                if (id.includes(keyword)) add(mod);
-            }
+            for (const [keyword, mod] of FORMAT_PROVIDER_KEYWORDS) if (id.includes(keyword)) add(mod);
         };
+        const base = String(format || '').split('@@@')[0].trim();
+        matchBase(base);
+        if (/^(gen\d+)?(nationaldex|natdex)?aaa$/.test(fmtId(base))) add(MOD.ALMOST_ANY_ABILITY);
 
-        const [baseFormat, rules] = String(format || '').split('@@@');
-        if (fmtHas(baseFormat, 'godlygift')) add(MOD.GODLY_GIFT);
-        fromText(baseFormat);
-        if (/^(gen\d+)?(nationaldex|natdex)?aaa$/.test(fmtId(baseFormat))) add(MOD.ALMOST_ANY_ABILITY); // "[Gen 9] AAA"
+        // Do NOT run substring matching on signed rules (a removed rule must not
+        // activate its mod). Rules are applied in their source order.
+        let unrestrictedAbilities = false;
+        let unrestrictedMoves = false;
+        for (const op of formatRuleTokens(format)) {
+            if (!['rule', 'value', 'replace', 'remove'].includes(op.kind)) continue;
+            const on = op.kind !== 'remove';
+            const id = op.id;
+            if (id === 'obtainable') {
+                unrestrictedAbilities = !on;
+                unrestrictedMoves = !on;
+            } else if (id === 'obtainableabilities') unrestrictedAbilities = !on;
+            else if (id === 'obtainablemoves') unrestrictedMoves = !on;
 
-        if (rules) {
-            for (const rule of rules.split(',')) {
-                const token = rule.trim();
-                if (!token) continue;
-                if (/^convergence(?:\s+legality|mod)?$/i.test(token)) add(MOD.CONVERGENCE);
-
-                // Removing a restriction means what it says: "!Obtainable Abilities" = any ability is
-                // legal (AAA), "!Obtainable Moves" = any move is legal, "!Obtainable" = both.
-                if (/^!\s*obtainable(\s+abilities)?$/i.test(token)) add(MOD.ALMOST_ANY_ABILITY);
-                if (/^!\s*obtainable(\s+moves)?$/i.test(token)) add(MOD.ALL_MOVES);
-
-                if (!/^[!+*-]/.test(token)) fromText(token); // bans / unbans / restrictions aren't mods
-            }
+            let matching = MOD_DEFINITIONS.filter((d) =>
+                toSearchId(d.challengeRule || '') === id ||
+                (d.formatKeywords || []).some((keyword) => id === keyword || id === keyword + 'mod') ||
+                (d.providerKeywords || []).some((keyword) => id === keyword ||
+                    id === keyword + 'mod' || id === keyword + 'movelegality')
+            ).map((d) => d.id);
+            // Showdown's current ruleset uses these precise legality names.
+            if (id === 'convergencelegality') matching.push(MOD.CONVERGENCE);
+            if (id === 'aaarestrictedabilities') matching.push(MOD.ALMOST_ANY_ABILITY);
+            if (id === 'godlygiftmod') matching.push(MOD.GODLY_GIFT);
+            if (id === 'sketchmonsmovelegality') matching.push(MOD.SKETCHMONS);
+            for (const mod of new Set(matching)) on ? add(mod) : remove(mod);
         }
+        if (unrestrictedAbilities) add(MOD.ALMOST_ANY_ABILITY);
+        if (unrestrictedMoves) add(MOD.ALL_MOVES);
         return mods;
     }
 
@@ -641,8 +882,12 @@
         if (b.loaded || b.sent) return;
         if (!window.app || typeof app.send !== 'function') return;
 
+        // Install the receiver before sending: a fast server response must not
+        // arrive before the suppression hook has been attached.
+        patchServerReceive();
         b.sent = true;
         b.silent = true;
+        b.sentAt = Date.now();
         app.send(b.command);
     }
 
@@ -655,7 +900,7 @@
 
     // The restricted list comes from the generic base banlist (plus custom rules), so nothing
     // is requested here: getMergedBans() asks the server once per format.
-    const isGodlyGiftFormat = (room) => fmtHas(room?.curTeam?.format, 'godlygift');
+    const isGodlyGiftFormat = (room) => modsFromFormatString(room?.curTeam?.format).includes(MOD.GODLY_GIFT);
     const isTierShiftAAAFormat = (room) => formatActive(room, 'tiershiftaaa', 'tsa');
     // The Convergence Megamons challenge code is based on Anything Goes and adds
     // Convergence Legality, !Obtainable Formes and individual +Mega entries.
@@ -664,22 +909,33 @@
     function isConvergenceMegamons(format) {
         const name = String(format || '').split('@@@')[0];
         if (fmtHas(name, 'convergencemegamons', 'megamonsconvergence')) return true;
-        const rules = String(format || '').split('@@@').slice(1).join('@@@');
-        return /(?:^|,)\s*convergence legality\s*(?:,|$)/i.test(rules) &&
-            (/(?:^|,)\s*!\s*obtainable formes\s*(?:,|$)/i.test(rules) ||
-             /(?:^|,)\s*\+[a-z0-9-]+-mega(?:-[xyz])?\s*(?:,|$)/i.test(rules));
+        // A removed Convergence rule is not an active Convergence format.
+        if (!modsFromFormatString(format).includes(MOD.CONVERGENCE)) return false;
+        const ops = formatRuleTokens(format);
+        const allowedMega = ops.some((op) => op.kind === 'unban' && /-mega(?:-[a-z0-9]+)?$/i.test(op.name || ''));
+        let unblockedFormes = false;
+        for (const op of ops) if (op.id === 'obtainableformes') {
+            if (op.kind === 'remove') unblockedFormes = true;
+            else if (['rule', 'replace'].includes(op.kind)) unblockedFormes = false;
+        }
+        return allowedMega || unblockedFormes;
     }
 
     function isConvergenceEnabled(format) {
-        return fmtHas(format, 'convergence') || isConvergenceMegamons(format);
+        return modsFromFormatString(format).includes(MOD.CONVERGENCE) || isConvergenceMegamons(format);
     }
 
     function explicitlyUnbannedForms(format) {
-        const rules = String(format || '').split('@@@').slice(1).join('@@@');
         const ids = new Set();
-        for (const token of rules.split(',')) {
-            const match = /^\s*\+\s*(.+?)\s*$/.exec(token);
-            if (match) ids.add(toID(match[1]));
+        // Follow Showdown custom-rule ordering. A later ban cancels an earlier
+        // unban, and a later unban re-enables the form.
+        for (const op of formatRuleTokens(format)) {
+            if (op.kind !== 'unban' && op.kind !== 'ban') continue;
+            const name = String(op.name || '').trim();
+            if (!name || /^(?:ability|move|item|type|teratype)\s*:/i.test(name)) continue;
+            const id = toID(name);
+            if (op.kind === 'unban') ids.add(id);
+            else ids.delete(id);
         }
         return ids;
     }
@@ -687,7 +943,9 @@
     const isConvergenceFormat = (room) => {
         const format = room?.curTeam?.format;
         if (isConvergenceMegamons(format)) return true;
-        return formatActive(room, 'convergence', 'conv');
+        const active = isConvergenceEnabled(format);
+        if (active) requestBanlist('conv');
+        return active;
     };
 
     // ---------- parsing ----------
@@ -698,7 +956,11 @@
         if (!html || (header && !html.includes(header))) return null;
 
         const doc = new DOMParser().parseFromString(html, 'text/html');
+        // The official /formathelp HTML places <summary>Banlist/Ruleset</summary>
+        // directly against <b>Ruleset</b>. textContent otherwise becomes
+        // 'Banlist/RulesetRuleset - ...', so the old regexp misses EVERY rule.
         doc.querySelectorAll('br').forEach((br) => br.replaceWith('\n'));
+        doc.querySelectorAll('summary, h2, hr, b').forEach((node) => node.before(doc.createTextNode('\n')));
         const text = doc.body.textContent || '';
 
         const re = /(^|[^A-Za-z])(Bans|Unbans|Restricted|Restrictions|Unrestricted|Ruleset|Rules|Custom Rules)\s+-\s+/g;
@@ -745,19 +1007,38 @@
     // Shared by Convergence and the generic per-format banlists.
     const RESTRICTED_KEY = {abilities: 'restrictedAbilities', moves: 'restrictedMoves', items: 'restrictedItems'};
     function classifyRuleToken(token) {
-        const ability = Dex.abilities.get(token);
-        if (ability?.exists) return {kind: 'abilities', id: ability.id};
-        const move = Dex.moves.get(token);
-        if (move?.exists) return {kind: 'moves', id: move.id};
-        const item = Dex.items.get(token);
-        if (item?.exists) return {kind: 'items', id: item.id};
+        const text = String(token || '').trim();
+        const typed = /^(pokemon|species|move|ability|item|type|teratype)\s*:\s*(.+)$/i.exec(text);
+        const forced = typed?.[1]?.toLowerCase() || '';
+        const value = typed ? typed[2].trim() : text;
+        if (forced === 'type' || forced === 'teratype') {
+            const type = Dex.types?.get?.(value);
+            return type?.exists ? {kind: forced === 'type' ? 'types' : 'teraTypes', id: toID(type.name)} : null;
+        }
+        if (forced === 'pokemon' || forced === 'species') {
+            const species = Dex.species.get(value);
+            return species?.exists ? {kind: 'species', id: species.id} : null;
+        }
+        const kinds = {ability: ['abilities', Dex.abilities], move: ['moves', Dex.moves], item: ['items', Dex.items]};
+        if (forced) {
+            const entry = kinds[forced];
+            if (!entry) return null;
+            const hit = entry[1].get(value);
+            return hit?.exists ? {kind: entry[0], id: hit.id} : null;
+        }
+        for (const [kind, database] of Object.values(kinds)) {
+            const hit = database.get(value);
+            if (hit?.exists) return {kind, id: hit.id};
+        }
         return null;
     }
 
     function parseBanSections(sections) {
         const bans = {
             species: new Set(), baseSpecies: new Set(), tiers: new Set(),
-            unbanned: new Set(), unbannedBase: new Set(), abilities: new Set(),
+            types: new Set(), teraTypes: new Set(),
+            unbanned: new Set(), unbannedBase: new Set(),
+            unbannedMoves: new Set(), unbannedAbilities: new Set(), unbannedItems: new Set(), abilities: new Set(),
             restricted: new Set(),
             restrictedBase: new Set(),
             restrictedAbilities: new Set(), // "*Comatose": only usable by Pokémon that natively have it
@@ -776,7 +1057,7 @@
             }
 
             if (/\s\+\s/.test(token)) { // "Regenerator + Wimp Out"
-                const parts = token.split('+').map((p) => Dex.abilities.get(p.trim()));
+                const parts = token.split('+').map((p) => Dex.abilities.get(p.trim().replace(/^ability\s*:\s*/i, '')));
                 if (parts.length >= 2 && parts.every((a) => a?.exists)) bans.abilityCombos.add(comboKey(parts.map((a) => a.id)));
                 else sawNonSpeciesBan = true;
                 continue;
@@ -797,18 +1078,31 @@
             ((formeOnly || !bansWholeSpecies(token, sp)) ? bans.species : bans.baseSpecies).add(sp.id);
         }
 
-        // Evasion Abilities Clause isn't in the /tier output, so (as before) it
-        // is assumed whenever a format bans anything that isn't a Pokémon.
-        if (sawNonSpeciesBan) {
-            bans.abilities.add('sandveil');
-            bans.abilities.add('snowcloak');
-        }
+        // Do not infer Evasion Abilities Clause merely because some other
+        // ability/item/move is banned; it is an independent rule.
 
         for (const token of sections.Unbans || []) {
+            const id = toID(token);
+            if (!id) continue;
             const sp = Dex.species.get(token);
-            if (!sp?.exists) continue;
-            bans.unbanned.add(sp.id);
-            if (bansWholeSpecies(token, sp)) bans.unbannedBase.add(sp.id);
+            // Mega formes may be absent from the local Pokédex, even though the
+            // server explicitly legalizes them. Preserve those species tokens.
+            const isSpecies = sp?.exists || /-mega(?:-[a-z0-9]+)?$/i.test(token);
+            const typed = isSpecies ? null : classifyRuleToken(token);
+            // +Spore, +Arena Trap, +King's Rock, etc. are NOT species unbans.
+            // The server's Unbans section contains all these kinds of entries.
+            if (typed && typed.kind !== 'species') {
+                if (typed.kind === 'moves') bans.unbannedMoves.add(typed.id);
+                if (typed.kind === 'abilities') bans.unbannedAbilities.add(typed.id);
+                if (typed.kind === 'items') bans.unbannedItems.add(typed.id);
+                continue;
+            }
+            // Retain raw species IDs for formes not yet present in the client Dex.
+            bans.unbanned.add(id);
+            if (sp?.exists) {
+                bans.unbanned.add(sp.id);
+                if (bansWholeSpecies(token, sp)) bans.unbannedBase.add(sp.id);
+            }
         }
 
         for (const token of [...(sections.Restricted || []), ...(sections.Restrictions || [])]) {
@@ -847,6 +1141,7 @@
         const restricted = bans.restricted.has(sp.id) || bans.restrictedBase.has(baseId);
         return bans.species.has(sp.id) ||
             bans.baseSpecies.has(baseId) ||
+            sp.types?.some((type) => bans.types?.has(toID(type))) ||
             (!ignoreTiers && !restricted && bans.tiers.has(tierId ?? toID(sp.tier)));
     }
 
@@ -873,7 +1168,7 @@
             if (!token) continue;
 
             if (/\s\+\s/.test(token)) { // ability combination
-                const parts = token.split('+').map((p) => Dex.abilities.get(p.trim()));
+                const parts = token.split('+').map((p) => Dex.abilities.get(p.trim().replace(/^ability\s*:\s*/i, '')));
                 if (parts.length >= 2 && parts.every((a) => a?.exists)) {
                     const key = comboKey(parts.map((a) => a.id));
                     if (sign === '-') bans.abilityCombos.add(key);
@@ -899,9 +1194,12 @@
             if (!sp?.exists) {
                 const hit = classifyRuleToken(token);
                 if (hit) {
-                    if (sign === '-') bans[hit.kind].add(hit.id);
-                    else if (sign === '+') bans[hit.kind].delete(hit.id);
-                    else bans[RESTRICTED_KEY[hit.kind]].add(hit.id);
+                    const unbans = hit.kind === 'moves' ? bans.unbannedMoves :
+                        hit.kind === 'abilities' ? bans.unbannedAbilities :
+                        hit.kind === 'items' ? bans.unbannedItems : null;
+                    if (sign === '-') { bans[hit.kind].add(hit.id); unbans?.delete(hit.id); }
+                    else if (sign === '+') { bans[hit.kind].delete(hit.id); unbans?.add(hit.id); }
+                    else if (RESTRICTED_KEY[hit.kind]) bans[RESTRICTED_KEY[hit.kind]].add(hit.id);
                 }
                 continue;
             }
@@ -926,6 +1224,81 @@
         return bans;
     }
 
+    // Source: smogon/pokemon-showdown data/rulesets.ts, rule definitions.
+    // Named rulesets are expanded locally for UI display without requesting
+    // /formathelp for each individual clause (which created needless PMs).
+    const SHOWDOWN_RULE_INHERITANCE = Object.freeze({
+        standardag: ['Obtainable', 'Team Preview', 'HP Percentage Mod', 'Cancel Mod', 'Endless Battle Clause'],
+        standard: ['Standard AG', 'Sleep Clause Mod', 'Species Clause', 'Nickname Clause', 'OHKO Clause', 'Evasion Items Clause', 'Evasion Moves Clause'],
+        standardoms: ['Standard AG', 'Species Clause', 'Nickname Clause', 'OHKO Clause', 'Evasion Moves Clause', 'Overflow Stat Mod'],
+        standardnatdex: ['Standard AG', 'NatDex Mod', 'Species Clause', 'Nickname Clause', 'OHKO Clause', 'Evasion Clause', 'Sleep Clause Mod'],
+        standarddoubles: ['Standard AG', 'Species Clause', 'Nickname Clause', 'OHKO Clause', 'Evasion Moves Clause', 'Gravity Sleep Clause'],
+        evasionclause: ['Evasion Abilities Clause', 'Evasion Items Clause', 'Evasion Moves Clause'],
+    });
+    const SHOWDOWN_RULE_BANLIST = Object.freeze({
+        ohkoclause: {moves: ['fissure', 'guillotine', 'horndrill', 'sheercold']},
+        // Exact server banlist; do not infer from move.status because other
+        // sleep-related moves do not automatically fall under this clause.
+        sleepmovesclause: {moves: ['darkvoid', 'grasswhistle', 'hypnosis', 'lovelykiss', 'sing', 'sleeppowder', 'spore', 'yawn']},
+        evasionabilitiesclause: {abilities: ['sandveil', 'snowcloak']},
+        evasionitemsclause: {items: ['brightpowder', 'laxincense']},
+        evasionmovesclause: {moves: ['acupressure', 'doubleteam', 'minimize']},
+        accuracymovesclause: {moves: ['flash', 'kinesis', 'leaftornado', 'mirrorshot', 'mudbomb', 'mudslap', 'muddywater', 'nightdaze', 'octazooka', 'sandattack', 'smokescreen']},
+        cfzclause: {moves: ['10000000voltthunderbolt', 'aciddownpour', 'alloutpummeling', 'blackholeeclipse', 'bloomdoom', 'breakneckblitz', 'catastropika', 'clangoroussoulblaze', 'continentalcrush', 'corkscrewcrash', 'devastatingdrake', 'extremeevoboost', 'genesissupernova', 'gigavolthavoc', 'guardianofalola', 'hydrovortex', 'infernooverdrive', 'letssnuggleforever', 'lightthatburnsthesky', 'maliciousmoonsault', 'menacingmoonrazemaelstrom', 'neverendingnightmare', 'oceanicoperetta', 'pulverizingpancake', 'savagespinout', 'searingsunrazesmash', 'shatteredpsyche', 'sinisterarrowraid', 'soulstealing7starstrike', 'splinteredstormshards', 'stokedsparksurfer', 'subzeroslammer', 'supersonicskystrike', 'tectonicrage', 'twinkletackle']},
+    });
+
+    function resolveClauseRules(bans, format) {
+        const effective = new Set();
+        // /formathelp's ruleset supplies the named format's server-verified
+        // rules, and @@@ tokens supply overrides for imported formats.
+        // Inline custom rules are processed in order, never by substring.
+        const ops = [...(bans.ruleset || []), ...formatRuleTokens(format).map((op) => op.raw)];
+        const activate = (id, path = new Set()) => {
+            if (path.has(id)) return;
+            effective.add(id);
+            const children = SHOWDOWN_RULE_INHERITANCE[id];
+            if (children) for (const name of children) activate(toSearchId(name), new Set([...path, id]));
+        };
+        const deactivate = (id, path = new Set()) => {
+            if (path.has(id)) return;
+            effective.delete(id);
+            const children = SHOWDOWN_RULE_INHERITANCE[id];
+            if (children) for (const name of children) deactivate(toSearchId(name), new Set([...path, id]));
+        };
+        for (const token of ops) {
+            const op = parseChallengeRule(token);
+            if (!op || !['rule', 'value', 'replace', 'remove'].includes(op.kind)) continue;
+            if (op.kind === 'remove') deactivate(op.id);
+            else activate(op.id);
+        }
+        return effective;
+    }
+
+    // This is an editor overlay, not a substitute for Showdown's TeamValidator.
+    // Especially for team-wide/compound clauses, the server is authoritative.
+    function addExplicitClauseBans(bans, format) {
+        if (!bans) return bans;
+        const effective = resolveClauseRules(bans, format);
+        for (const id of effective) {
+            const lists = SHOWDOWN_RULE_BANLIST[id];
+            if (!lists) continue;
+            for (const [kind, entries] of Object.entries(lists)) {
+                const unbanned = kind === 'moves' ? bans.unbannedMoves :
+                    kind === 'items' ? bans.unbannedItems : bans.unbannedAbilities;
+                for (const moveId of entries) if (!unbanned?.has(moveId)) bans[kind].add(moveId);
+            }
+        }
+        if (effective.has('zmoveclause') || effective.has('gemsclause')) {
+            for (const [key, item] of Object.entries(window.BattleItems || {})) {
+                const id = toID(item?.id || key);
+                if (!id || bans.unbannedItems?.has(id)) continue;
+                if (effective.has('zmoveclause') && item?.zMove) bans.items.add(id);
+                if (effective.has('gemsclause') && item?.isGem) bans.items.add(id);
+            }
+        }
+        return bans;
+    }
+
     // The format's bans with the team's custom rules applied; null until the base list has loaded.
     function getMergedBansForFormat(format, seen = new Set()) {
         const baseId = fmtId(String(format || '').split('@@@')[0]);
@@ -934,11 +1307,11 @@
         // Convergence has a named list of its own, but is excluded from the
         // generic /tier cache. Keep its bans available to the ability search
         // decorator as well as the movepool provider.
-        if (!isConvergenceMegamons(format) && fmtHas(format, 'convergence') && convergenceBans) {
+        if (!isConvergenceMegamons(format) && isConvergenceEnabled(format) && convergenceBans) {
             const rules = String(format).split('@@@')[1] || '';
-            if (!rules.trim()) return convergenceBans;
+            if (!rules.trim()) return addExplicitClauseBans(cloneBans(convergenceBans), format);
             const tokens = rules.split(',').map((t) => t.replace(/\s+/g, ' ').trim()).filter(Boolean);
-            return applyCustomRuleTokens(convergenceBans, tokens);
+            return addExplicitClauseBans(applyCustomRuleTokens(convergenceBans, tokens), format);
         }
 
         const id = genericBanFormatId(format);
@@ -954,14 +1327,17 @@
         for (const rule of [...entry.bans.ruleset, ...tokens]) {
             if (/^[!+*-]/.test(rule)) continue;
             const id = toID(rule);
-            if (removed.has(id) || !window.BattleFormats?.[id]) continue;
+            // Named rules/clause inheritance is handled by resolveClauseRules.
+            // They are not independent ladder formats; requesting /formathelp
+            // for every rule causes spurious PMs and unusable banlist caches.
+            if (removed.has(id) || RULE_CATALOG.has(id) || !window.BattleFormats?.[id]) continue;
             const inherited = getMergedBansForFormat(id, new Set(seen));
             if (!inherited) continue;
             for (const key of Object.keys(merged)) {
                 if (merged[key] instanceof Set) for (const value of inherited[key] || []) merged[key].add(value);
             }
         }
-        return applyCustomRuleTokens(merged, tokens);
+        return addExplicitClauseBans(applyCustomRuleTokens(merged, tokens), format);
     }
 
     const getMergedBans = (room) => getMergedBansForFormat(room?.curTeam?.format);
@@ -1026,7 +1402,9 @@
     function emptyBanSections() {
         return {
             species: new Set(), baseSpecies: new Set(), tiers: new Set(),
-            unbanned: new Set(), unbannedBase: new Set(), abilities: new Set(),
+            types: new Set(), teraTypes: new Set(),
+            unbanned: new Set(), unbannedBase: new Set(),
+            unbannedMoves: new Set(), unbannedAbilities: new Set(), unbannedItems: new Set(), abilities: new Set(),
             restricted: new Set(), restrictedBase: new Set(), restrictedAbilities: new Set(),
             abilityCombos: new Set(), ruleset: [],
             moves: new Set(), items: new Set(), restrictedMoves: new Set(), restrictedItems: new Set(),
@@ -1052,10 +1430,13 @@
     function requestGenericBanlist(id) {
         let entry = genericBanlists.get(id);
         if (!entry) {
-            entry = {loaded: true, silent: false, bans: inferredTierBans(id)};
+            // The inferred bans are a temporary UI hint, not a complete RuleTable.
+            // Convergence must NOT treat this as verified donor legality.
+            entry = {loaded: true, verified: false, silent: false, bans: inferredTierBans(id)};
             genericBanlists.set(id, entry);
         }
-        if (!entry.sentAt && window.app?.send) {
+        if (!entry.sentAt && !entry.verified && window.app?.send) {
+            patchServerReceive();
             entry.sentAt = Date.now();
             entry.silent = true;
             app.send('/formathelp ' + id);
@@ -1063,63 +1444,92 @@
         return entry;
     }
 
-    // Returns null if the reply isn't ours, otherwise {suppress} (true only
-    // for the reply to our own silent request).
-    function handleGenericBanlistRaw(html) {
-        if (!html || !genericBanlists.size || !html.includes('<h2>')) return null;
+    // PMs created by /formathelp and /tier have no request ID. Match their
+    // headings against *outstanding* script requests, never against old cache
+    // entries: otherwise users' own /tier replies can disappear.
+    const SILENT_BANLIST_TIMEOUT = 30000;
+    const pendingGenericEntries = () => [...genericBanlists.entries()].filter(([, entry]) =>
+        entry.silent && entry.sentAt && Date.now() - entry.sentAt < SILENT_BANLIST_TIMEOUT);
+    const namedRequestPending = (key) => {
+        const entry = BL[key];
+        return !!entry?.silent && !!entry.sentAt && Date.now() - entry.sentAt < SILENT_BANLIST_TIMEOUT;
+    };
 
-        // "natdex" and "nationaldex" are the same thing in format names.
-        const normFmt = (id) => id.replace(/natdex/g, 'nationaldex');
-
-        const title = new DOMParser().parseFromString(html, 'text/html').querySelector('h2')?.textContent || '';
-        const titleId = normFmt(fmtId(title));
-        console.log(LOG, 'banlist reply title:', JSON.stringify(title), '| pending:', [...genericBanlists.keys()]);
-        const titleIsNatdex = titleId.includes('nationaldex');
-
-        let formatId = [...genericBanlists.keys()].find((k) => normFmt(k) === titleId) || null;
-
-        // Title didn't match: if exactly one request is still waiting, assume it's
-        // the reply, but natdex-ness must agree in BOTH directions.
-        if (!formatId) {
-            const waiting = [...genericBanlists.entries()].filter(([id, e]) =>
-                                                                  !e.loaded && e.silent && Date.now() - e.sentAt < 15000 &&
-                                                                  normFmt(id).includes('nationaldex') === titleIsNatdex
-                                                                 );
-            if (waiting.length === 1 && /Bans\s*<\/b>\s*-/.test(html)) {
-                formatId = waiting[0][0];
-                console.log(LOG, `Banlist title "${title}" did not match "${formatId}"; assuming it is the reply.`);
-            }
-        }
-        if (!formatId) return null;
-
-        const entry = genericBanlists.get(formatId);
+    function cacheGenericBanlistReply(formatId, html) {
         const sections = parseFormatSectionTokens(html, null);
-        if (!sections) return null;
-
-        if (!Object.keys(sections).length) return null;
+        if (!sections || !Object.keys(sections).length) return false;
+        const entry = genericBanlists.get(formatId) || {loaded: false, verified: false};
         entry.bans = parseBanSections(sections);
         for (const tier of inferredTierBans(formatId).tiers) entry.bans.tiers.add(tier);
         entry.merged = null;
         entry.loaded = true;
-        if (isConvergenceMegamons(getActiveTeambuilderRoom()?.curTeam?.format) || isConvergenceMegamons(formatId)) {
-            convergenceIndexCache.clear();
-            convergenceMoveCache.clear();
-        }
-        console.log(LOG, `Loaded bans for ${title}`);
-
-
-        const suppress = entry.silent;
-        entry.silent = false; // later manual /tier replies show normally
-
+        entry.verified = true;
+        entry.silent = false;
+        genericBanlists.set(formatId, entry);
+        convergenceIndexCache.clear();
+        convergenceMoveCache.clear();
         const room = getTeambuilderRoom();
-        if (room?.search?.engine?.typedSearch) refreshSearch(room, {clearBase: true});
         const engine = room?.search?.engine;
-        if (engine?.abilitySearch) clearSearchCache(engine.abilitySearch);
-        if (engine?.typedSearch?.searchType === 'ability') refreshSearch(room, {clearBase: true});
-        if (room?.curSet && getActiveMods(room).includes(MOD.GODLY_GIFT)) {
-            try { room.updateStatForm(); room.updateStatGraph(); } catch (e) { /* not on screen */ }
+        for (const search of [engine?.typedSearch, engine?.moveSearch, engine?.abilitySearch]) {
+            if (search) clearSearchCache(search);
         }
-        return {suppress};
+        if (engine) refreshSearch(room, {clearBase: true});
+        if (room?.curSet && getActiveMods(room).includes(MOD.GODLY_GIFT)) {
+            try { room.updateStatForm?.(); room.updateStatGraph?.(); } catch (e) { /* not on screen */ }
+        }
+        return true;
+    }
+
+    function finishGenericBanlistReply(formatId, html) {
+        const entry = genericBanlists.get(formatId);
+        if (!entry?.silent) return false;
+        // Unrecognized responses still belong to the script, but they must
+        // not incorrectly mark a placeholder banlist as server-verified.
+        if (!cacheGenericBanlistReply(formatId, html)) entry.silent = false;
+        return true;
+    }
+
+    // /formathelp can also be shown in room chat as |c|~|/raw, as in the
+    // user's Alphabet Cup log. Learn its rules without removing that message
+    // or creating a hidden /formathelp request. Only accept the exact active
+    // format title; never import unrelated room chatter into the team rules.
+    function observePublicFormatHelp(packet) {
+        if (typeof packet !== 'string' || !packet.includes('/raw')) return;
+        const active = getActiveTeambuilderRoom()?.curTeam?.format;
+        const id = fmtId(String(active || '').split('@@@')[0]);
+        if (!id) return;
+        for (const line of packet.split('\n')) {
+            const match = /^(?:\|c\|~\|\/raw |\|raw\|)(<div[\s\S]*)/.exec(line);
+            if (!match) continue;
+            const html = match[1];
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const title = doc.querySelector('h2')?.textContent || '';
+            if (fmtId(title) !== id) continue;
+            cacheGenericBanlistReply(id, html);
+        }
+    }
+
+    function handleGenericBanlistRaw(html) {
+        if (!html) return false;
+        const waiting = pendingGenericEntries();
+        if (!waiting.length) return false;
+        const title = new DOMParser().parseFromString(html, 'text/html').querySelector('h2')?.textContent || '';
+        const normFmt = (id) => id.replace(/natdex/g, 'nationaldex');
+        const titleId = normFmt(fmtId(title));
+        let formatId = titleId ? waiting.find(([id]) => normFmt(id) === titleId)?.[0] : null;
+        if (!formatId && waiting.length === 1 && titleId) {
+            // Some formats use aliases, but same-generation alone is NOT a
+            // match (it could be another user's manual /tier command).
+            const [id] = waiting[0];
+            const registeredName = fmtId(window.BattleFormats?.[id]?.name);
+            if (registeredName && normFmt(registeredName) === titleId) formatId = id;
+        }
+        if (!formatId && waiting.length === 1 && !titleId && /<table\b/i.test(html)) {
+            // /formathelp may reply with a table when its search finds many
+            // matches, rather than a single format's <h2> heading.
+            formatId = waiting[0][0];
+        }
+        return formatId ? finishGenericBanlistReply(formatId, html) : false;
     }
 
     // First native ability (any slot) of `sp` that the format bans, else null.
@@ -1169,58 +1579,84 @@
         ['[Gen 9] Convergence', 'conv', parseConvergenceBanlist],
     ];
 
-    // Returns true if this /raw line is the reply to one of our silent requests.
-    function consumeRawLine(rawHtml) {
-        let suppress = false;
+    // /tier and /formathelp replies are routed through the special PM target
+    // "~". Real server packets normally look like
+    //     |pm| userName|~|/raw <div ...>
+    // NOT necessarily |pm|~|~|/raw; the old matcher ignored the real packets.
+    // Check exactly one side is the ~ command target and only consume replies
+    // when a matching script-owned lookup is outstanding. Never block player
+    // PMs, room chat, manually requested /tier, or other protocol traffic.
+    // https://github.com/smogon/pokemon-showdown/blob/master/PROTOCOL.md
+    function scriptPendingBanlist() {
+        return Object.keys(BL).some(namedRequestPending) || pendingGenericEntries().length > 0;
+    }
 
+    function consumeRawLine(html) {
+        let suppress = false;
         for (const [header, key, parse] of RAW_HANDLERS) {
-            if (!rawHtml.includes(header)) continue;
-            parse(rawHtml);
-            if (BL[key].silent) {
-                BL[key].silent = false;
-                suppress = true;
+            if (!html.includes(header) || !namedRequestPending(key)) continue;
+            try { parse(html); } catch (e) { console.warn(LOG, `Failed to parse ${key} bans:`, e); }
+            BL[key].silent = false;
+            suppress = true;
+        }
+        if (!suppress) {
+            try {
+                if (handleGenericBanlistRaw(html)) suppress = true;
+            } catch (e) {
+                console.warn(LOG, 'Generic banlist parse failed:', e);
             }
         }
-
-        // Isolated so a bug here can never stop messages reaching the client.
-        try {
-            if (handleGenericBanlistRaw(rawHtml)?.suppress) suppress = true;
-        } catch (e) {
-            console.error(LOG, 'Generic banlist parse failed:', e);
-        }
-
         return suppress;
+    }
+
+    function consumeScriptServerPm(line) {
+        const match = /^\|pm\|([^|]*)\|([^|]*)\|([\s\S]*)$/.exec(line);
+        if (!match) return false;
+        // Pokemon Showdown uses the recipient "~" as its command-result PM box.
+        // The sender may be the logged-in user's displayed name (with rank and
+        // leading space), as in |pm| username|~|/raw ... . Some server/client
+        // variants reverse those positions, and older variants use ~ for both.
+        const sender = match[1].trim();
+        const receiver = match[2].trim();
+        if (sender !== '~' && receiver !== '~') return false;
+        const message = match[3];
+        if (message.startsWith('/raw ')) return consumeRawLine(message.slice(5));
+
+        // /formathelp replies with /error when the requested format doesn't
+        // exist. These errors were the main source of phantom PM windows.
+        // Mark only one outstanding query as finished; don't hide any other PM.
+        if (/^\/error\s+(?:No matched formats found\.|No matched formats found|The format .* does not exist\.?)/i.test(message)) {
+            const generic = pendingGenericEntries();
+            if (generic.length) {
+                generic[0][1].silent = false;
+                return true;
+            }
+            const namedKey = Object.keys(BL).find(namedRequestPending);
+            if (namedKey) { BL[namedKey].silent = false; return true; }
+        }
+        return false;
+    }
+
+    // Remove the *entire* protocol PM line before Showdown creates the PM tab.
+    // This also works when several messages share a single WebSocket packet.
+    function filterSilentServerMessages(data) {
+        if (typeof data !== 'string' || !data.includes('|pm|') || !scriptPendingBanlist()) return data;
+        const parts = data.split('\n');
+        const kept = parts.filter((line) => !consumeScriptServerPm(line));
+        return kept.length === parts.length ? data : kept.join('\n');
     }
 
     function patchServerReceive() {
         return patchMethod(window.app, 'receive', '__qolPatched', (original) =>
-                           function (data) {
-            let payload = data;
-
-            try {
-                if (typeof data === 'string' && data.includes('/raw ')) {
-                    let modified = false;
-
-                    const kept = data.split('\n').filter((line) => {
-                        const match = line.includes('/raw ') && line.match(/\/raw (.*)/s);
-                        if (!match) return true;
-
-                        const suppress = consumeRawLine(match[1]);
-                        if (suppress) modified = true;
-                        return !suppress;
-                    });
-
-                    if (modified) payload = kept.join('\n');
-                }
-            } catch (e) {
-                console.error(LOG, 'Failed to parse server data:', e);
-                payload = data;
+            function (data) {
+                let payload = data;
+                try { observePublicFormatHelp(data); } catch (e) { console.warn(LOG, 'Formathelp observer failed:', e); }
+                try { payload = filterSilentServerMessages(data); }
+                catch (e) { console.warn(LOG, 'Failed to filter banlist PM:', e); }
+                if (!payload || !payload.trim() || /^>[^\n]+\n?$/.test(payload)) return;
+                return original.call(this, payload);
             }
-
-            if (payload === '') return;
-            return original.call(this, payload);
-        }
-                          );
+        );
     }
 
     // Tier Shift AAA: ban list applied on top of the Gen 9 pool.
@@ -1281,9 +1717,9 @@
     // Re-Evolution: double the stat difference between this species and its
     // immediately previous evolution stage. Species without a previous stage
     // are unchanged. Base stats are capped at 255, as in the OM.
-    function reevolutionModifiedStats(species, from = species?.baseStats) {
+    function reevolutionModifiedStats(species, from = species?.baseStats,
+        dex = getActiveTeambuilderRoom()?.curTeam?.dex || window.Dex) {
         if (!species?.baseStats || !from || !species.prevo) return null;
-        const dex = window.Dex || (typeof Dex !== 'undefined' ? Dex : null);
         const prevo = dex?.species?.get?.(species.prevo);
         if (!prevo?.exists || !prevo.baseStats || prevo.battleOnly) return null;
         const stats = copy(from);
@@ -1346,7 +1782,8 @@
     function foldSpeciesStats(mods, species) {
         let stats = null;
         for (const mod of orderModsByShowdownPriority(mods)) {
-            const next = SPECIES_STAT_MODIFIERS[mod]?.(species, stats || species.baseStats);
+            const next = SPECIES_STAT_MODIFIERS[mod]?.(
+                species, stats || species.baseStats, getActiveTeambuilderRoom()?.curTeam?.dex || window.Dex);
             if (next) stats = clampBaseStats(next);
         }
         return stats;
@@ -1360,7 +1797,7 @@
 
     function speciesModBaseStats(mod, dex, set, from) {
         const species = dex?.species?.get(set?.species);
-        return species?.exists ? SPECIES_STAT_MODIFIERS[mod](species, from || species.baseStats) : null;
+        return species?.exists ? SPECIES_STAT_MODIFIERS[mod](species, from || species.baseStats, dex) : null;
     }
 
     // The +stat and -stat base stats trade places. Neutral natures: no change.
@@ -1381,7 +1818,7 @@
         [MOD.GODLY_GIFT]: (from, {room, set}) => godlyGiftBaseStats(room, set, from),
         [MOD.CROSS_EVOLUTION]: (from, {dex, set}) => crossEvolutionBaseStats(dex, set, from),
         [MOD.FRANTIC_FUSIONS]: (from, {dex, set}) => franticFusionsBaseStats(dex, set, from),
-        [MOD.REEVOLUTION]: (from, {dex, set}) => reevolutionModifiedStats(dex?.species?.get(set?.species), from),
+        [MOD.REEVOLUTION]: (from, {dex, set}) => reevolutionModifiedStats(dex?.species?.get(set?.species), from, dex),
         [MOD.NATURE_SWAP]: (from, {dex, set}) => natureSwapBaseStats(dex, set, from),
     };
     for (const mod of Object.keys(SPECIES_STAT_MODIFIERS)) {
@@ -1478,6 +1915,16 @@
         if (hasMixAndMega && !hasCamomons) {
             const next = mixAndMegaModifiedTypes(dex, set, types);
             if (next) types = next;
+        }
+        // Bonus Type Mod grants the Tera Type as an additional typing (without
+        // actually Terastallizing). Duplicates are suppressed, so Pokémon can
+        // have one, two, or three types as on Showdown.
+        if (asMods(mods).includes(MOD.BONUS_TYPE) && set?.teraType && dex?.types?.get) {
+            const bonus = dex.types.get(set.teraType);
+            if (bonus?.exists) {
+                const natural = types || dex.species.get(set.species)?.types || [];
+                types = [...new Set([...natural, bonus.name])];
+            }
         }
         return types;
     }
@@ -2061,7 +2508,33 @@
     // the /formathelp reply is in flight.
     function getConvergenceGroup(dex, species, format) {
         const megamons = isConvergenceMegamons(format);
+        // Showdown's Convergence Legality uses RuleTable.isBannedSpecies for
+        // EACH donor, not merely the recipient. This includes Smeargle, whose
+        // Sketch-derived move search may otherwise expose essentially every
+        // move to Normal-types such as Arceus.
+        //
+        // Do not build/copy a donor pool from a placeholder inferred banlist:
+        // the named format's banlist may still be arriving via /formathelp.
+        // Fail closed until we have authoritative bans, while allowing the
+        // recipient's own native learnset to appear normally.
+        if (megamons) {
+            const baseId = genericBanFormatId(format);
+            const entry = baseId ? requestGenericBanlist(baseId) : null;
+            if (!entry?.verified) return [];
+        } else {
+            if (!convergenceBans) {
+                requestBanlist('conv');
+                return [];
+            }
+        }
         const explicitlyAllowed = megamons ? explicitlyUnbannedForms(format) : new Set();
+        // Showdown's convergencelegality also requires donors to be standard,
+        // unless +tag:<nonstandard category> explicitly permits that category.
+        // +Pokemon-Mega makes a forme selectable; it does NOT, by itself,
+        // enable Future/Past donors to transfer moves or abilities.
+        const allowedDonorTags = new Set(formatRuleTokens(format)
+            .filter((op) => op.kind === 'unban' && /^tag\s*:/i.test(op.name || ''))
+            .map((op) => toID(String(op.name).split(':').slice(1).join(':'))));
         const bans = megamons ? getMergedBansForFormat(format) : convergenceBans;
         const bannedIds = bans?.species || new Set();
         const bannedBases = bans?.baseSpecies || new Set();
@@ -2071,18 +2544,19 @@
             index = new Map();
             for (const id of Object.keys(window.BattlePokedex || {})) {
                 const sp = dex.species.get(id);
-                if (!sp?.exists || sp.id !== id || sp.gen > dex.gen) continue;
+                if (!sp?.exists || sp.id !== id) continue;
                 const allowedByRule = explicitlyAllowed.has(sp.id) ||
                     !!bans?.unbanned?.has(sp.id) ||
                     !!bans?.unbannedBase?.has(toID(sp.baseSpecies || sp.name));
-                if (megamons) {
-                    // Mega formes can be used as starting Pokémon. Normal
-                    // battle-only formes are also usable if available in Gen 9.
-                    // Never expose nonstandard historical formes unless unbanned.
-                    if (sp.isNonstandard && !allowedByRule &&
-                        !(fmtHas(String(format).split('@@@')[0], 'convergencemegamons') &&
-                          /mega/i.test(sp.forme || ''))) continue;
-                } else if (sp.battleOnly || sp.isNonstandard) continue;
+                // The rules explicitly introduce some newer Mega formes into
+                // a Gen 9 battle. Their Pokédex generation is not an implicit
+                // ban once the challenge code explicitly unbans that forme.
+                if (sp.gen > dex.gen && !allowedByRule) continue;
+                // Match the simulator's Convergence donor gate: a specific
+                // +Mega unban does not bypass its isNonstandard tag check.
+                // Conversely, a genuinely standard/unbanned Mega can donate.
+                if (sp.isNonstandard && !allowedDonorTags.has(toID(sp.isNonstandard))) continue;
+                if (!megamons && sp.battleOnly) continue;
                 if (CONVERGENCE_EXCLUDED_DONORS.has(sp.id)) continue;
                 // Explicit bans always take priority over the special form rule.
                 if (bannedIds.has(sp.id) || bannedBases.has(toID(sp.baseSpecies || sp.name))) {
@@ -2109,7 +2583,7 @@
 
         map = new Map();
 
-        for (const member of getConvergenceGroup(search.dex, species, getActiveTeambuilderRoom()?.curTeam?.format || search.format)) {
+        for (const member of getConvergenceGroup(search.dex, species, activeFormat)) {
             const rows = withSearchSpecies(search, member.name, base);
             let header = null;
 
@@ -2125,7 +2599,7 @@
     }
 
     function convergenceMoveResults(search, base) {
-        const results = base();
+        let results = base();
         if (!search.species) return results;
 
         // Do not gate the entire Convergence provider on /tier. Some Showdown
@@ -2138,6 +2612,22 @@
 
         const species = search.dex.species.get(search.species);
         if (!species?.exists) return results;
+
+        const activeFormat = getActiveTeambuilderRoom()?.curTeam?.format || search.format;
+        if (isConvergenceMegamons(activeFormat) &&
+            (species.isMega || /-mega(?:-[a-z0-9]+)?$/i.test(species.name))) {
+            // A Mega with a base species available in SV keeps that base
+            // species' natural learnset (Sceptile-Mega can use Shed Tail).
+            // A Mega with a dexited base species only receives donor moves.
+            const baseSpecies = search.dex.species.get(species.baseSpecies);
+            if (baseSpecies?.exists && !baseSpecies.isNonstandard) {
+                const baseRows = withSearchSpecies(search, baseSpecies.name, base);
+                results = baseRows;
+            } else {
+                // A Mega's native historical learnset is not automatically legal.
+                results = results.filter(row => row[0] !== 'move');
+            }
+        }
 
         const map = getConvergenceMoveMap(search, base, species);
         const have = new Set(results.filter((r) => r[0] === 'move').map((r) => r[1]));
@@ -2176,8 +2666,13 @@
         const species = search.dex.species.get(search.species);
         if (!species?.exists) return results;
 
+        const activeFormat = getActiveTeambuilderRoom()?.curTeam?.format || search.format;
+        const megaRecipient = isConvergenceMegamons(activeFormat) &&
+            (species.isMega || /-mega(?:-[a-z0-9]+)?$/i.test(species.name));
         const notes = results.filter((r) => r[0] === 'html');
-        const own = results.filter((r) => r[0] === 'ability');
+        // Mega formes cannot retain their own abilities. They can only select
+        // an ability supplied by a non-Mega donor of the same current typing.
+        const own = megaRecipient ? [] : results.filter((r) => r[0] === 'ability');
         // Custom-format searches can start with no native abilities. Convergence
         // must still contribute the shared-typing ability pool.
         const seen = new Set(own.map((r) => r[1]));
@@ -2200,7 +2695,9 @@
         extra.sort((a, b) => a[1].localeCompare(b[1]));
         addDonors(search, donors);
 
-        return extra.length ? [...notes, ['header', 'Converged Abilities'], ...own, ...extra] : results;
+        return megaRecipient
+            ? [...notes, ['header', 'Converged Abilities'], ...extra]
+            : (extra.length ? [...notes, ['header', 'Converged Abilities'], ...own, ...extra] : results);
     }
 
     // ====================================================================
@@ -2210,35 +2707,72 @@
     // ---------- Alphabet Cup ----------
 
     const ALPHABET_CUP_FORMAT_ID = 'alphabetcup';
+    // The same Dex is shared between normal and custom-rule/National Dex formats.
+    // NEVER cache the move pool solely by Dex: whether "Past" moves exist is
+    // determined by the active RuleTable (not by an object's .exists field).
     const alphabetCupCache = new WeakMap();
+    const moveProviderFormat = (search) =>
+        getActiveTeambuilderRoom()?.curTeam?.format || search?.format || '';
 
-    // Per-dex: eligible move ids grouped by first letter, plus a cache of each species' letters.
-    function getAlphabetCupCache(dex) {
-        let cache = alphabetCupCache.get(dex);
+    // Mirror the Showdown validator's generation/existence gate *before*
+    // applying an OM movepool rule. Alphabet Cup and STABmons both check
+    // move.isNonstandard === 'Past' && !ruleTable.has('natdexmod'), plus
+    // isZ/isMax/restricted. See data/rulesets.ts in smogon/pokemon-showdown.
+    // Explicit custom unbans can override a move/tag, but a move introduced in
+    // a future generation can't be simulated in an older Dex.
+    const moveFormatRuleCache = new Map();
+    function moveFormatRules(format) {
+        const key = String(format || '');
+        const existing = moveFormatRuleCache.get(key);
+        if (existing) return existing;
+        const tokens = formatRuleTokens(key);
+        const unbans = new Set(tokens.filter((op) => op.kind === 'unban').map((op) => op.id));
+        const result = {natdex: isNationalDexFormat(key), lgpe: /^gen7letsgo/.test(fmtId(key.split('@@@')[0])), unbans};
+        // Imported codes can be very long, but only a few are edited at once.
+        if (moveFormatRuleCache.size >= 40) moveFormatRuleCache.delete(moveFormatRuleCache.keys().next().value);
+        moveFormatRuleCache.set(key, result);
+        return result;
+    }
+    function moveAllowedByGeneration(dex, move, format = '') {
+        if (!move?.exists || !move.id || move.isZ || move.isMax) return false;
+        if (Number.isFinite(move.gen) && move.gen > dex.gen) return false;
+        const tag = move.isNonstandard;
+        if (!tag || tag === 'Unobtainable') return true; // OM Unobtainable Moves may allow the latter.
+        const {natdex, lgpe, unbans} = moveFormatRules(format);
+        const explicit = unbans.has(move.id) || unbans.has('move' + move.id) ||
+            unbans.has(toSearchId(tag)) || unbans.has('tag' + toSearchId(tag));
+        if (tag === 'Past') return natdex || explicit;
+        if (tag === 'LGPE') return lgpe || explicit;
+        if (tag === 'Future') return explicit;
+        // CAP/Let's Go/Legends/Gmax/etc. are not ordinary game moves.
+        return explicit;
+    }
+
+    // Reuse the eligibility pool across Alphabet Cup, !Obtainable Moves,
+    // Sketchmons, and Typemons, while keeping their independent legality rules.
+    function getAlphabetCupCache(dex, format = '') {
+        let caches = alphabetCupCache.get(dex);
+        if (!caches) { caches = new Map(); alphabetCupCache.set(dex, caches); }
+        const key = String(format || '');
+        let cache = caches.get(key);
         if (cache) return cache;
-
         cache = {byLetter: new Map(), ids: new Set(), letters: new Map()};
-
         for (const id of Object.keys(window.BattleMovedex || {})) {
             const move = dex.moves.get(id);
-            if (!move?.exists || move.id !== id) continue;
-            if (move.isZ || move.isMax || move.isNonstandard === 'CAP') continue;
-
-            const letter = move.name.charAt(0).toLowerCase();
+            if (move?.id !== id || !moveAllowedByGeneration(dex, move, format)) continue;
+            const letter = move.id.charAt(0);
             if (!/[a-z]/.test(letter)) continue;
-
             cache.ids.add(id);
             if (!cache.byLetter.has(letter)) cache.byLetter.set(letter, []);
             cache.byLetter.get(letter).push(id);
         }
-
-        alphabetCupCache.set(dex, cache);
+        caches.set(key, cache);
         return cache;
     }
 
     // First letter of the species' name and of every pre-evolution's name.
-    function alphabetCupLetters(dex, species) {
-        const cache = getAlphabetCupCache(dex);
+    function alphabetCupLetters(dex, species, format = '') {
+        const cache = getAlphabetCupCache(dex, format);
         let letters = cache.letters.get(species.id);
         if (letters) return letters;
 
@@ -2248,28 +2782,31 @@
 
         while (cur?.exists && !seen.has(cur.id)) {
             seen.add(cur.id);
-            const ch = cur.name.charAt(0).toLowerCase();
+            const ch = cur.id.charAt(0);
             if (/[a-z]/.test(ch)) letters.add(ch);
-            cur = cur.prevo ? dex.species.get(cur.prevo) : null;
+            // Silvally forms have Type: Null as an evolutionary predecessor in
+            // the simulator's Alphabet Cup legality rule.
+            const prevo = cur.changesFrom === 'Silvally' ? 'Type: Null' : cur.prevo;
+            cur = prevo ? dex.species.get(prevo) : null;
         }
 
         cache.letters.set(species.id, letters);
         return letters;
     }
 
-    function alphabetCupMoveIds(dex, species) {
-        const cache = getAlphabetCupCache(dex);
+    function alphabetCupMoveIds(dex, species, format = '') {
+        const cache = getAlphabetCupCache(dex, format);
         const ids = [];
-        for (const letter of alphabetCupLetters(dex, species)) {
+        for (const letter of alphabetCupLetters(dex, species, format)) {
             ids.push(...(cache.byLetter.get(letter) || []));
         }
         return ids;
     }
 
-    function alphabetCupCanLearn(dex, species, moveId) {
+    function alphabetCupCanLearn(dex, species, moveId, format = '') {
         const move = dex.moves.get(moveId);
-        if (!move?.exists || !getAlphabetCupCache(dex).ids.has(move.id)) return false;
-        return alphabetCupLetters(dex, species).has(move.name.charAt(0).toLowerCase());
+        if (!moveAllowedByGeneration(dex, move, format) || !getAlphabetCupCache(dex, format).ids.has(move.id)) return false;
+        return alphabetCupLetters(dex, species, format).has(move.id.charAt(0));
     }
 
     // Native learnset check OR Alphabet Cup letter rule (used by Pokémon search filters).
@@ -2301,11 +2838,12 @@
                 return native || (mods.includes(MOD.ALMOST_ANY_ABILITY) && allAbilityIds(ctx.dex).includes(id));
             }
             if (bans?.moves?.has(id)) return false;
+            if (!moveAllowedByGeneration(ctx.dex, ctx.dex.moves.get(id), format)) return false;
             if (native) return true;
             if (bans?.restrictedMoves?.has(id)) return false;
-            if (mods.includes(MOD.STABMONS) && stabmonsCanLearn(ctx.dex, species, id, isNationalDexFormat(format))) return true;
-            if (mods.includes(MOD.ALPHABET_CUP) && alphabetCupCanLearn(ctx.dex, species, id)) return true;
-            return getAlphabetCupCache(ctx.dex).ids.has(id) &&
+            if (mods.includes(MOD.STABMONS) && stabmonsCanLearn(ctx.dex, species, id, isNationalDexFormat(format), format)) return true;
+            if (mods.includes(MOD.ALPHABET_CUP) && alphabetCupCanLearn(ctx.dex, species, id, format)) return true;
+            return getAlphabetCupCache(ctx.dex, format).ids.has(id) &&
                 (mods.includes(MOD.ALL_MOVES) || (mods.includes(MOD.TYPEMONS) && ctx.__qolTypemons === ctx.dex.moves.get(id).type));
         }
         const Search = kind === 'move' ? window.BattleMoveSearch : window.BattleAbilitySearch;
@@ -2323,13 +2861,14 @@
             !(probe.__qolGroups || []).some((group) => group.kind === kind && group.test(r[1])))
             .map((r) => r[1]));
         cache.set(cacheKey, ids);
-        return ids.has(toID(target));
+        return ids.has(toID(target)) && (kind !== 'move' ||
+            moveAllowedByGeneration(ctx.dex, ctx.dex.moves.get(id), format));
     }
 
     const stabmonsTypeCache = new WeakMap();
-    function stabmonsCanLearn(dex, species, id, natdex) {
+    function stabmonsCanLearn(dex, species, id, natdex, format = '') {
         const move = dex.moves.get(id);
-        if (!species?.exists || !species.name || !move?.exists || move.gen > dex.gen || move.isZ || move.isMax || move.isNonstandard === 'CAP') return false;
+        if (!species?.exists || !species.name || !moveAllowedByGeneration(dex, move, format)) return false;
         let cache = stabmonsTypeCache.get(dex);
         if (!cache) stabmonsTypeCache.set(dex, cache = new Map());
         const key = `${species.id}|${natdex}|${move.gen}`;
@@ -2376,7 +2915,7 @@
         const natdex = isNationalDexFormat(getActiveTeambuilderRoom()?.curTeam?.format || search.format);
         const have = new Set(results.filter((r) => r[0] === 'move').map((r) => r[1]));
         const additions = Object.keys(window.BattleMovedex || {}).filter((id) =>
-            !have.has(id) && stabmonsCanLearn(search.dex, species, id, natdex));
+            !have.has(id) && stabmonsCanLearn(search.dex, species, id, natdex, moveProviderFormat(search)));
         return addMovesToResults(search, results, species, additions);
     }
 
@@ -2387,7 +2926,7 @@
         const species = search.dex.species.get(search.species);
         if (!species?.exists) return results;
 
-        return addMovesToResults(search, results, species, alphabetCupMoveIds(search.dex, species));
+        return addMovesToResults(search, results, species, alphabetCupMoveIds(search.dex, species, moveProviderFormat(search)));
     }
 
     // ---------- Camove Chaos: every move is legal ----------
@@ -2402,7 +2941,7 @@
         if (!species?.exists) return results;
 
         const have = new Set(results.filter((r) => r[0] === 'move').map((r) => r[1]));
-        const add = [...getAlphabetCupCache(search.dex).ids].filter((id) => !have.has(id));
+        const add = [...getAlphabetCupCache(search.dex, moveProviderFormat(search)).ids].filter((id) => !have.has(id));
         return add.length ? addMovesToResults(search, results, species, add) : results;
     }
 
@@ -2421,7 +2960,7 @@
         const selected = (search.set?.moves || []).map((move) => toID(move)).filter(Boolean);
         if (selected.some((move) => !legalPool.has(move))) return results;
 
-        const extras = [...getAlphabetCupCache(search.dex).ids].filter((id) => !legalPool.has(id));
+        const extras = [...getAlphabetCupCache(search.dex, moveProviderFormat(search)).ids].filter((id) => !legalPool.has(id));
         return extras.length ? addMovesToResults(search, results, species, extras) : results;
     }
 
@@ -2467,7 +3006,7 @@
         if (!type) return results;
 
         const have = new Set(results.filter((r) => r[0] === 'move').map((r) => r[1]));
-        const add = [...getAlphabetCupCache(search.dex).ids].filter((id) =>
+        const add = [...getAlphabetCupCache(search.dex, moveProviderFormat(search)).ids].filter((id) =>
                                                                     !have.has(id) && search.dex.moves.get(id).type === type);
         return add.length ? addMovesToResults(search, results, species, add) : results;
     }
@@ -2480,7 +3019,7 @@
     function natdexMoveIds(dex, species) {
         const T = window.BattleTeambuilderTable || {};
         const tables = [T.learnsets];
-        for (let g = 1; g <= 9; g++) tables.push(T['gen' + g]?.learnsets);
+        for (let g = 1; g <= Math.max(1, dex.gen); g++) tables.push(T['gen' + g]?.learnsets);
 
         // species + base formes + battleOnly sources + every pre-evolution
         const keys = [];
@@ -2514,7 +3053,7 @@
 
             const exists = move?.exists || !!raw.num;
 
-            if (!exists) return false;
+            if (!exists || (move?.gen ?? raw.gen ?? 0) > dex.gen) return false;
 
             // Prefer the Dex data, but use raw data for old moves that aren't
             // represented by the current Gen 9 Dex.
@@ -2632,7 +3171,7 @@
         ids = [];
         for (const id of Object.keys(window.BattleAbilities || {})) {
             const ability = dex.abilities.get(id);
-            if (ability?.exists && ability.id === id && !ability.isNonstandard && id !== 'noability') ids.push(id);
+            if (ability?.exists && ability.id === id && (!ability.gen || ability.gen <= dex.gen) && !ability.isNonstandard && id !== 'noability') ids.push(id);
         }
         ids.sort((a, b) => dex.abilities.get(a).name.localeCompare(dex.abilities.get(b).name));
         allAbilityCache.set(dex, ids);
@@ -3004,7 +3543,14 @@
                 nativeBySpecies.set(key, rows);
                 return rows;
             };
-            return moveBannedMovesToHeader(this, runProviderChain(MOVE_PROVIDERS, this, nativeRows), nativeRows);
+            // A provider may augment a native list with otherwise existing but
+            // wrong-generation moves. Enforce the same game-generation boundary
+            // for the final picker, not only the per-provider caches.
+            const format = moveProviderFormat(this);
+            const rows = runProviderChain(MOVE_PROVIDERS, this, nativeRows);
+            const eligible = rows.filter((row) => row[0] !== 'move' ||
+                moveAllowedByGeneration(this.dex, this.dex.moves.get(row[1]), format));
+            return moveBannedMovesToHeader(this, eligible, nativeRows);
         }
                           );
     }
@@ -3587,7 +4133,7 @@
 
     // Godly Gift: other Restricted mons move to an "Illegal results" section.
     function applyGodlyGiftLegality(search, results) {
-        if (!fmtHas(search.format, 'godlygift')) return results;
+        if (!modsForSearch(search).includes(MOD.GODLY_GIFT)) return results;
 
         const room = getTeambuilderRoom();
         const isIllegal = room && getGodlyGiftIllegalChecker(room);
@@ -3622,6 +4168,28 @@
         return cache.pools.get(format);
     }
 
+    // The native search does not parse custom rules or server-side /formathelp.
+    // For named Megamons formats, the whitelist only becomes available once the
+    // corresponding formathelp response is verified; for imported @@@ formats,
+    // explicit +Mega tokens are available immediately.
+    function megamonsLegalMegaIds(format, dex = window.Dex) {
+        if (!isConvergenceMegamons(format)) return new Set();
+        const bans = getMergedBansForFormat(format);
+        const allowed = new Set(explicitlyUnbannedForms(format));
+        if (bans) for (const id of bans.unbanned) allowed.add(id);
+        const result = new Set();
+        for (const id of allowed) {
+            if (!/-?mega(?:[a-z0-9]+)?$/.test(id)) continue;
+            const sp = dex?.species?.get(id);
+            if (!sp?.exists || !window.BattlePokedex?.[sp.id]) continue;
+            // This is a species/forme whitelist, not permission to use all
+            // nonstandard Pokemon or otherwise banned forms.
+            if (bans && isBannedByList(bans, sp)) continue;
+            result.add(sp.id);
+        }
+        return result;
+    }
+
     function patchPokemonSearchResults() {
         patchMethod(window.BattlePokemonSearch?.prototype, 'getBaseResults', '__qolUnbannedPoolPatched', (original) =>
             function () {
@@ -3630,14 +4198,17 @@
                 const bans = getMergedBansForFormat(format);
                 const isMegaConv = isConvergenceMegamons(format);
                 const explicit = isMegaConv ? explicitlyUnbannedForms(format) : new Set();
-                if (!explicit.size && !bans?.unbanned?.size && !bans?.unbannedBase?.size) return rows;
+                const legalMegas = megamonsLegalMegaIds(format, this.dex);
+                if (!legalMegas.size && !explicit.size && !bans?.unbanned?.size && !bans?.unbannedBase?.size) return rows;
                 const have = new Set(rows.filter((r) => r[0] === 'pokemon').map((r) => r[1]));
                 const extra = [];
                 for (const id of Object.keys(window.BattlePokedex || {})) {
                     const sp = this.dex.species.get(id);
-                    if (!sp?.exists || have.has(id) || sp.gen > this.dex.gen) continue;
-                    if (explicit.has(id) || bans?.unbanned?.has(id) ||
-                        bans?.unbannedBase?.has(toID(sp.baseSpecies || sp.name))) {
+                    if (!sp?.exists || have.has(id)) continue;
+                    const allowed = legalMegas.has(id) || explicit.has(id) || bans?.unbanned?.has(id) ||
+                        bans?.unbannedBase?.has(toID(sp.baseSpecies || sp.name));
+                    if (sp.gen > this.dex.gen && !allowed) continue;
+                    if (allowed && (!bans || !isBannedByList(bans, sp))) {
                         extra.push(['pokemon', id]);
                     }
                 }
@@ -3660,6 +4231,17 @@
                 this.__qolProviderPools = null;
             }
             this.__qolProviderBans = getMergedBansForFormat(providerFormat);
+
+            // A named format's server reply can change its Mega legality AFTER
+            // the native search has computed baseResults/baseIllegalResults.
+            // Clear BOTH caches before calling its getResults, otherwise a
+            // newly legal Mega remains in the native "Illegal results" bucket.
+            const legalMegas = megamonsLegalMegaIds(providerFormat, this.dex);
+            const megaKey = `${providerFormat}|${[...legalMegas].sort().join(',')}`;
+            if (this.__qolMegamonsLegalKey !== megaKey) {
+                this.__qolMegamonsLegalKey = megaKey;
+                clearSearchCache(this);
+            }
 
             // Remember the active into/from chips for sort().
             const findChip = (kind) => {
@@ -3765,7 +4347,7 @@
         return [...ids].filter((id) => {
             const move = dex.moves.get(id);
             const raw = window.BattleMovedex?.[id] || {};
-            if (!move?.exists && !raw.num) return false;
+            if ((!move?.exists && !raw.num) || (move?.gen ?? raw.gen ?? 0) > dex.gen) return false;
             // Fortemons uses damaging moves; its legality rules handle bans.
             if ((move?.category || raw.category) === 'Status') return false;
             const nonstandard = move?.isNonstandard ?? raw.isNonstandard;
@@ -5396,13 +5978,30 @@
         const Optimizer = window.BattleStatOptimizer;
         if (typeof Optimizer !== 'function') return false;
         if (Optimizer.__qolFormatPatched) return true;
+
+        // The old client invokes BattleStatOptimizer(set, format) as a regular
+        // function from checkStatOptimizations(), not with `new`. Intercept
+        // apply() and normalize argument 1 (format), NOT argument 0 (set).
+        // The optimizer only needs a real Dex mod to read its generation and
+        // mechanics; our own wrappers supply the custom species base stats.
+        const nativeOptimizerFormat = (format) => {
+            const base = String(format || '').split('@@@')[0];
+            const resolved = resolveFormatKey(base) || toID(base);
+            const room = getActiveTeambuilderRoom();
+            const match = String(resolved).match(/^gen(\d+)(?=[a-z]|$)/);
+            const generation = Number(match?.[1] || room?.curTeam?.dex?.gen || room?.curTeam?.gen || window.Dex?.gen || 9);
+            return `gen${generation}`;
+        };
         const Wrapped = new Proxy(Optimizer, {
+            apply(target, thisArg, args) {
+                const normalized = args.slice();
+                if (normalized.length > 1) normalized[1] = nativeOptimizerFormat(normalized[1]);
+                return Reflect.apply(target, thisArg, normalized);
+            },
             construct(target, args, newTarget) {
-                if (typeof args[0] === 'string') {
-                    args = args.slice();
-                    args[0] = statGuesserFormat(args[0]);
-                }
-                return Reflect.construct(target, args, newTarget);
+                const normalized = args.slice();
+                if (normalized.length > 1) normalized[1] = nativeOptimizerFormat(normalized[1]);
+                return Reflect.construct(target, normalized, newTarget);
             },
         });
         Wrapped.__qolFormatPatched = true;
@@ -5410,20 +6009,88 @@
         return true;
     }
 
+    // Custom challenge formats can retain a stale team.gen even when their
+    // format explicitly says gen9. Showdown chooses between Tera Type and
+    // Hidden Power controls using curTeam.gen, not the actual battle rules.
+    // Reconcile only explicitly generation-prefixed formats; don't infer one
+    // from a custom name or override a generation-less legacy team.
+    function syncExplicitFormatGeneration(team) {
+        if (!team) return false;
+        const format = String(team.format || '');
+        const match = format.match(/^gen(\d+)(?=[a-z]|@@@|$)/i);
+        // The custom Convergence Megamons rules use Scarlet/Violet mechanics
+        // even when the challenge-code base format has a different generation.
+        // Also support a saved imported-format label, and the future named OM.
+        const megamons = isConvergenceMegamons(format) ||
+            toSearchId(getCustomFormatLabel(format)) === 'convergencemegamons' ||
+            toSearchId(team.name || '') === 'convergencemegamons';
+        const generation = match ? Number(match[1]) : megamons ? 9 : null;
+        if (!Number.isInteger(generation) || generation < 1) return false;
+        if (team.gen === generation && team.dex?.gen === generation) return false;
+        // Don't fabricate a Dex for a generation the live client doesn't have.
+        let generationDex = null;
+        try {generationDex = typeof Dex.forGen === 'function' ? Dex.forGen(generation) : null;}
+        catch (e) {return false;}
+        if (!generationDex || generationDex.gen !== generation) return false;
+        team.gen = generation;
+        team.dex = generationDex;
+        return true;
+    }
+
+    // Showdown's team overview and details dialog have different render paths.
+    // Guard both BEFORE their native layout code reads curTeam.gen: a later
+    // refresh must not restore an older-generation Hidden Power selector.
+    function patchCustomTeamGenerationRendering() {
+        const proto = window.TeambuilderRoom?.prototype;
+        if (!proto) return false;
+        // Install each available hook independently. Array.every short-circuits
+        // if a client version lacks one method, leaving subsequent hooks absent.
+        // The outer update entry point also covers re-opening the team overview.
+        const methods = ['update', 'updateChart', 'updateDetailsForm', 'renderSet'];
+        let patched = 0;
+        for (const method of methods) {
+            if (typeof proto[method] !== 'function') continue;
+            if (patchMethod(proto, method, '__qolGenBeforeRender_' + method,
+                (original) => function (...args) {
+                    syncExplicitFormatGeneration(this.curTeam);
+                    return original.apply(this, args);
+                })) patched++;
+        }
+        return patched > 0;
+    }
+
     function patchStatForm() {
         const proto = window.TeambuilderRoom?.prototype;
-
-        const updateForm = patchMethod(proto, 'updateStatForm', '__qolPatched', (original) =>
-                                       function (setGuessed) {
-            const result = withActiveModdedStatSpecies(this, () => original.call(this, setGuessed));
-
-            applyModBaseStatColumn(this);
-            if (getActiveMods(this).includes(MOD.MIX_AND_MEGA) && this.curSet?.species) {
-                renderMixAndMegaSpeedNote(this);
+        // Details are recreated on each visit. Ensure a Gen 9 custom format
+        // cannot silently render Gen 7's Hidden Power menu after re-enabling.
+        const detailsForm = patchMethod(proto, 'updateDetailsForm', '__qolSyncFormatGenDetails', (original) =>
+            function (...args) {
+                syncExplicitFormatGeneration(this.curTeam);
+                return original.apply(this, args);
             }
-            return result;
-        }
-                                      );
+        );
+
+        // Showdown's native updateStatForm(true) SAVES the guessed EVs but only
+        // calls updateStatGraph()/natureChange(). It does NOT replace the stat
+        // inputs/sliders. Rebuild once, synchronously, from the committed set.
+        // Do both calls inside the same species override to keep custom-format
+        // base stats consistent; never invoke another guessed spread.
+        const updateForm = patchMethod(proto, 'updateStatForm', '__qolPatched', (original) =>
+            function (setGuessed) {
+                const result = withActiveModdedStatSpecies(this, () => {
+                    const value = original.call(this, setGuessed);
+                    if (setGuessed === true && this.curSet) {
+                        original.call(this, false);
+                    }
+                    return value;
+                });
+                applyModBaseStatColumn(this);
+                if (getActiveMods(this).includes(MOD.MIX_AND_MEGA) && this.curSet?.species) {
+                    renderMixAndMegaSpeedNote(this);
+                }
+                return result;
+            }
+        );
 
         // Same post-hook for these: re-apply the base stat column.
         const columnPatches = ['updateStatGraph', 'natureChange'].map((key) =>
@@ -5437,32 +6104,9 @@
                                                                                  )
                                                                      );
 
-        // Auto-EVs are determined before updateStatGraph; patch the guessing entry
-        // point too, otherwise EVs will lag until the set is reopened.
-        const guessPatches = ['setStatFormGuesses', 'checkStatOptimizations'].map((key) =>
-            typeof proto?.[key] !== 'function' || patchMethod(proto, key, '__qolModded_' + key,
-                (original) => function (...args) {
-                    const before = this.curSet && JSON.stringify([this.curSet.evs, this.curSet.nature]);
-                    const result = withActiveModdedStatSpecies(this, () => original.apply(this, args));
-                    const after = this.curSet && JSON.stringify([this.curSet.evs, this.curSet.nature]);
-                    // In some builds the auto-spread callback commits EVs after
-                    // rendering the stat panel. Only refresh when values changed;
-                    // do not recursively rerun the optimizer or mutate the set.
-                    if (before !== after && !this.__qolGuessRefreshPending) {
-                        const room = this, set = this.curSet;
-                        room.__qolGuessRefreshPending = true;
-                        requestAnimationFrame(() => {
-                            room.__qolGuessRefreshPending = false;
-                            if (room.curSet !== set || !room.curTeam) return;
-                            try {
-                                room.updateStatForm?.(false);
-                                room.updateStatGraph?.();
-                            } catch (e) { console.warn(LOG, 'EV graph refresh failed:', e); }
-                        });
-                    }
-                    return result;
-                })
-        );
+        // No deferred guessed-EV redraw: the updateStatForm(true) wrapper above
+        // immediately follows the native save with updateStatForm(false).
+        // Asynchronous refreshes can race Safari's editor and leave inputs blank.
 
         const statSlide = patchMethod(proto, 'statSlide', '__qolPatched', (original) =>
                                       function (...args) {
@@ -5472,7 +6116,7 @@
         }
                                      );
 
-        return updateForm && statSlide && columnPatches.every(Boolean) && guessPatches.every(Boolean);
+        return detailsForm && updateForm && statSlide && columnPatches.every(Boolean);
     }
 
     // The Details pane's type icons come from the *named* species with no
@@ -5536,7 +6180,23 @@
                 ({val, nickname} = resolveIntoSelection(this, val));
             }
 
+            const megaConvPick = chartName === 'pokemon' && isConvergenceMegamons(this.curTeam?.format);
+            const previousItem = megaConvPick ? this.curSet?.item || '' : null;
             const result = original.call(this, val, selectNext);
+
+            if (megaConvPick && this.curSet) {
+                const selected = Dex.species.get(this.curSet.species);
+                const held = Dex.items.get(this.curSet.item);
+                // Native Showdown auto-fills Mega Stones when selecting a Mega
+                // forme. Megamons treats Mega formes as ordinary species.
+                if (selected?.isMega && held?.exists && held.megaStone &&
+                    this.curSet.item !== previousItem) {
+                    this.curSet.item = previousItem;
+                    this.$('input[name=item]').val(previousItem);
+                    refreshItemIcon(this);
+                    this.save?.();
+                }
+            }
 
             if (nickname && this.curSet) {
                 this.curSet.name = nickname;
@@ -5647,59 +6307,71 @@
 
     // ---------- Godly Gift ----------
 
-    const godBaseId = (species) => toID(species.baseSpecies || species.name);
 
-    // Same resolution the sim uses: Mega Stone / Red-Blue Orb change the God's
-    // forme, and battleOnly formes resolve to the species they come from.
+    // Resolve the *eligibility* species. Showdown checks whether a team member
+    // is an Uber/AG God using its battle-only base forme, modified by a held
+    // Mega Stone or Crowned-form item where applicable. This is distinct from
+    // the donor base-stat species (the team's original set species).
     function resolveGodSpecies(dex, set) {
-        if (!dex || !set?.species) return null;
-
+        if (!dex?.species?.get || !set?.species) return null;
         let species = dex.species.get(set.species);
         if (!species?.exists) return null;
-
-        const item = set.item ? dex.items.get(set.item) : null;
-        if (item?.exists) {
-            let forme = null;
-            if (item.megaStone) {
-                forme = item.megaStone[species.name];
-            } else if (item.id === 'redorb' && species.baseSpecies === 'Groudon') {
-                forme = 'Groudon-Primal';
-            } else if (item.id === 'blueorb' && species.baseSpecies === 'Kyogre') {
-                forme = 'Kyogre-Primal';
-            }
-            const formeSpecies = forme ? dex.species.get(forme) : null;
-            if (formeSpecies?.exists) species = formeSpecies;
-        }
-
         if (typeof species.battleOnly === 'string') {
-            const prior = dex.species.get(species.battleOnly);
-            if (prior?.exists) species = prior;
+            const base = dex.species.get(species.battleOnly);
+            if (base?.exists) species = base;
         }
-
+        const item = set.item ? dex.items?.get?.(set.item) : null;
+        if (item?.exists) {
+            let forme = '';
+            // In Showdown's public Dex data, `megaStone` is normally a string,
+            // and `megaEvolves` is the species name. Preserve compatibility with
+            // any client builds exposing the older mapping representation.
+            if (typeof item.megaStone === 'string' &&
+                (!item.megaEvolves || toID(item.megaEvolves) === toID(species.name))) {
+                forme = item.megaStone;
+            } else if (item.megaStone && typeof item.megaStone === 'object') {
+                forme = item.megaStone[species.name] || item.megaStone[species.baseSpecies] || '';
+            }
+            if (!forme && item.id === 'redorb' && species.baseSpecies === 'Groudon') forme = 'Groudon-Primal';
+            if (!forme && item.id === 'blueorb' && species.baseSpecies === 'Kyogre') forme = 'Kyogre-Primal';
+            if (!forme && item.id === 'rustedsword' && species.baseSpecies === 'Zacian') forme = 'Zacian-Crowned';
+            if (!forme && item.id === 'rustedshield' && species.baseSpecies === 'Zamazenta') forme = 'Zamazenta-Crowned';
+            const transformed = forme ? dex.species.get(forme) : null;
+            if (transformed?.exists) species = transformed;
+        }
         return species;
     }
 
-    // Restricted by exact forme id or by base species.
+    const godBaseId = (species) => toID(species.baseSpecies || species.name);
+
+    // Tier data is available synchronously from the generation-specific Dex.
+    // The /formathelp restricted list is optional extra information: it should
+    // never be the *only* way of finding a God, particularly in custom mods.
     function isGodlyGiftRestricted(species, room = getActiveTeambuilderRoom()) {
         if (!species?.exists) return false;
         const baseId = godBaseId(species);
-        if (godlyGiftRestricted.has(species.id) || godlyGiftRestricted.has(baseId)) return true;
+        const format = room?.curTeam?.format || '';
+        const natdex = isNationalDexFormat(format);
+        const tier = toID(natdex ? (species.natDexTier || species.tier) : species.tier).replace(/^nd(?=uber|ag)/, '');
+        if (tier === 'uber' || tier === 'ag') return true;
 
+        // Restriction lists correspond to the official Gen 9 Godly Gift format;
+        // don't apply them blindly to other generations' custom rule stacks.
+        if (formatGeneration(format) === 9 && fmtHas(format.split('@@@')[0], 'godlygift') &&
+            (godlyGiftRestricted.has(species.id) || godlyGiftRestricted.has(baseId))) return true;
         const bans = getMergedBans(room);
         return !!bans && (bans.restricted.has(species.id) || bans.restrictedBase.has(baseId));
     }
 
-    // True once the format's restricted list (with custom rules) is known.
-    const godlyGiftReady = (room) => godlyGiftRestricted.size > 0 || !!getMergedBans(room);
+    // No network response is needed to calculate a God's tier or base stats.
+    const godlyGiftReady = (room) => !!room?.curTeam?.dex?.species?.get;
 
-    // First teammate that is Restricted (or has Power Construct, when
-    // `powerConstruct` is set). Null if none.
+    // First God in team order, including Power Construct. The caller can
+    // exclude the set currently being edited when checking the one-God rule.
     function findGodSet(room, {ignoreSet = null, powerConstruct = true} = {}) {
         const team = room?.curSetList;
-        if (!Array.isArray(team) || !room.curTeam) return null;
-
+        if (!Array.isArray(team) || !room?.curTeam) return null;
         const dex = room.curTeam.dex;
-
         return team.find((set) => {
             if (!set?.species || set === ignoreSet) return false;
             if (powerConstruct && toID(set.ability) === 'powerconstruct') return true;
@@ -5707,47 +6379,55 @@
         }) || null;
     }
 
-    // Each of the God's 6 base stats is donated to the matching team slot
-    // (slot 0 gets HP, slot 1 Atk, ...). If nobody is a God, slot 1 is.
+    // Unlike god *eligibility*, the actual donor stats are taken from the
+    // original team species. E.g. a Mega Stone can make a Pokemon eligible as
+    // a God without giving every receiver that Mega's higher base stats.
+    function godlyGiftStatDonor(dex, set) {
+        if (!dex?.species?.get || !set?.species) return null;
+        let species = dex.species.get(set.species);
+        if (!species?.exists) return null;
+        if (typeof species.battleOnly === 'string') {
+            const prior = dex.species.get(species.battleOnly);
+            if (prior?.exists) species = prior;
+        }
+        return species;
+    }
+
     function godlyGiftDonation(room, set) {
         const team = room?.curSetList;
-        if (!room?.curTeam || !set || !Array.isArray(team) || !team.length) return null;
-        if (!godlyGiftReady(room)) return null; // banlist not loaded yet
-
+        if (!godlyGiftReady(room) || !set || !Array.isArray(team) || !team.length) return null;
         const index = team.indexOf(set);
-        if (index < 0 || index > 5) return null;
-
+        if (index < 0 || index >= STATS.length) return null;
         const godSet = findGodSet(room) || team[0];
-        const godSpecies = resolveGodSpecies(room.curTeam.dex, godSet);
-        if (!godSpecies) return null;
-
+        const donor = godlyGiftStatDonor(room.curTeam.dex, godSet);
+        if (!donor?.baseStats) return null;
         const stat = STATS[index];
-        return {stat, value: godSpecies.baseStats[stat]};
+        return {stat, value: donor.baseStats[stat]};
     }
 
     function godlyGiftBaseStats(room, set, from) {
-        const species = room?.curTeam?.dex?.species?.get(set?.species);
+        const dex = room?.curTeam?.dex;
+        const species = dex?.species?.get?.(set?.species);
         if (!species?.exists) return null;
-
         const stats = copy(from || species.baseStats);
         const donation = godlyGiftDonation(room, set);
-        if (donation) stats[donation.stat] = donation.value;
+        if (donation) {
+            stats[donation.stat] = donation.value;
+            if (dex.gen === 1 && (donation.stat === 'spa' || donation.stat === 'spd')) {
+                stats.spa = donation.value;
+                stats.spd = donation.value;
+            }
+        }
         return stats;
     }
 
-    // Returns `(species) => boolean` (true = illegal to add), or null if no God
-    // has been picked yet. While the Pokémon chooser is open, the slot being
-    // edited is ignored so the God itself can be swapped.
     function getGodlyGiftIllegalChecker(room) {
         if (!isGodlyGiftFormat(room) || !godlyGiftReady(room)) return null;
-
         const ignoreSet = room.curChartName === 'pokemon' ? room.curSet : null;
         const godSet = findGodSet(room, {ignoreSet, powerConstruct: false});
         if (!godSet) return null;
-
         const godSpecies = resolveGodSpecies(room.curTeam.dex, godSet);
         if (!godSpecies) return null;
-
         const godId = godBaseId(godSpecies);
         return (species) => isGodlyGiftRestricted(species, room) && godBaseId(species) !== godId;
     }
@@ -5765,11 +6445,11 @@
         if (!base) return '';
         const resolved = resolveFormatKey(base) || toID(base);
         const team = getActiveTeambuilderRoom()?.curTeam;
-        const gen = Number(resolved.match(/^gen([1-9])(?!\d)/)?.[1] || team?.dex?.gen || team?.gen || Dex.gen || 9);
+        const gen = formatGeneration(resolved, team?.dex?.gen || team?.gen || Dex.gen || 9);
         // Dex.mod expects an actual Dex generation/mod, not a challenge-code
         // nickname (e.g. STAAABnB). Do not create a fake gen9staaabnb mod.
         // The QOL stat wrappers independently supply modified base stats.
-        return /^gen[1-9](?!\d)/.test(resolved) ? resolved : `gen${gen}`;
+        return `gen${gen}`;
     }
 
     // The native constructor passes the first four characters straight to
@@ -6127,7 +6807,7 @@
         if (String(format || '').includes('@@@')) return format;
         const [base, ruleText = ''] = String(format || '').split('@@@');
         const baseMod = window.BattleFormats?.[base]?.mod;
-        const gen = String(baseMod || base).match(/^gen(\d+)/i)?.[1] || String(base).match(/^gen(\d)/i)?.[1] || '9';
+        const gen = formatGeneration(baseMod, formatGeneration(base, getActiveTeambuilderRoom()?.curTeam?.gen || Dex.gen || 9));
         const rules = new Map();
         for (const mod of modsFromFormatString(base)) {
             const rule = SELF_CHALLENGE_MOD_RULES[mod];
@@ -6807,7 +7487,7 @@
     // format can itself contain those delimiters, which makes its own loader
     // split the line in the wrong place on the next page load. Store such
     // formats behind a delimiter-safe token and decode them after unpacking.
-    const STORED_CUSTOM_FORMAT_PREFIX = 'gen9qolcustomfmt_';
+    const STORED_CUSTOM_FORMAT_PREFIX = 'qolcustomfmt_';
     function encodeStoredCustomFormat(format) {
         const text = String(format);
         // Ordinary custom rules are safe in Showdown's team metadata. Only
@@ -6818,15 +7498,18 @@
         try {
             const encoded = btoa(unescape(encodeURIComponent(text)))
             .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-            return STORED_CUSTOM_FORMAT_PREFIX + encoded;
+            // Preserve the actual Gen prefix so Showdown's native unpacker
+            // assigns the right generation *before* our decoder runs.
+            return `gen${formatGeneration(text, window.Dex?.gen || 9)}${STORED_CUSTOM_FORMAT_PREFIX}${encoded}`;
         } catch (e) {
             return format;
         }
     }
     function decodeStoredCustomFormat(format) {
-        if (!String(format || '').startsWith(STORED_CUSTOM_FORMAT_PREFIX)) return format;
+        const prefix = /^(?:gen\d+)?qolcustomfmt_/.exec(String(format || ''))?.[0];
+        if (!prefix) return format;
         try {
-            const encoded = String(format).slice(STORED_CUSTOM_FORMAT_PREFIX.length)
+            const encoded = String(format).slice(prefix.length)
             .replace(/-/g, '+').replace(/_/g, '/');
             const padded = encoded + '='.repeat((4 - encoded.length % 4) % 4);
             return decodeURIComponent(escape(atob(padded)));
@@ -6867,7 +7550,7 @@
             entry.name = slash >= 0 ? location.slice(slash + 1) : location;
             entry.folder = slash >= 0 ? location.slice(0, slash) : '';
             entry.team = line.slice(teamPipe + 1);
-            entry.gen = Number(format.match(/^gen(\d+)/i)?.[1]) || 9;
+            entry.gen = formatGeneration(format, entry.gen || window.Dex?.gen || 9);
             changed = true;
         }
         return changed;
@@ -6892,7 +7575,7 @@
                 const decoded = decodeStoredCustomFormat(team.format);
                 if (decoded !== team.format) {
                     team.format = decoded;
-                    team.gen = Number(String(decoded).match(/^gen(\d+)/i)?.[1]) || team.gen || 9;
+                    team.gen = formatGeneration(decoded, team.gen || window.Dex?.gen || 9);
                 }
             }
             return teams;
@@ -6906,7 +7589,7 @@
             const decoded = decodeStoredCustomFormat(team.format);
             if (decoded === team.format) continue;
             team.format = decoded;
-            team.gen = Number(String(decoded).match(/^gen(\d+)/i)?.[1]) || team.gen || 9;
+            team.gen = formatGeneration(decoded, team.gen || window.Dex?.gen || 9);
             decodedExisting = true;
         }
         if (decodedExisting) storage.saveTeams?.();
@@ -6916,28 +7599,45 @@
     }
 
     // "nationaldexgodlygift" -> "gen9nationaldexgodlygift" (the client's own format id), or null.
-    function resolveFormatKey(text) {
-        const id = toSearchId(text);
+    function resolveFormatKey(text, preferredGeneration = null) {
+        const raw = String(text || '').trim();
+        const id = toSearchId(raw);
         if (!id) return null;
-
         const formats = window.BattleFormats || {};
         if (formats[id]) return id;
 
-        const currentGen = String(getActiveTeambuilderRoom()?.curTeam?.format || '').match(/^gen\d+/)?.[0];
-        if (currentGen && formats[currentGen + id]) return currentGen + id;
+        // "[Gen 4] OU", "Gen 4 OU", and "gen4ou" resolve to the same key.
+        const labelled = /^(?:\[\s*gen\s*(\d+)\s*\]|gen\s*(\d+))\s*(.+)$/i.exec(raw);
+        if (labelled) {
+            const gen = Number(labelled[1] || labelled[2]);
+            const suffix = toSearchId(labelled[3]);
+            if (Number.isInteger(gen) && gen > 0 && suffix) return `gen${gen}${suffix}`;
+        }
+        const explicitGen = /^gen(\d+)(.+)$/.exec(id);
+        if (explicitGen) return id; // keep deliberate custom/legacy generation IDs
+        const cur = getActiveTeambuilderRoom()?.curTeam;
+        const preferred = preferredGeneration ?? formatGeneration(cur?.format, cur?.gen);
+        if (Number.isInteger(preferred) && formats[`gen${preferred}${id}`]) return `gen${preferred}${id}`;
 
-        const genOf = (key) => Number(key.match(/^gen(\d+)/)?.[1]) || 0;
-        const hits = Object.keys(formats).filter((key) => stripGen(key) === id).sort((a, b) => genOf(b) - genOf(a));
-        if (hits.length) return hits[0];
-
-        return /^gen\d+./.test(id) ? id : null; // explicit "genNformat" the client list doesn't know yet
+        // Also accept the client format's display name (e.g. "Gen 4 UU").
+        const nameHit = Object.keys(formats).find((key) => toSearchId(formats[key]?.name) === id);
+        if (nameHit) return nameHit;
+        const genOf = (key) => formatGeneration(key, 0) || 0;
+        const hits = Object.keys(formats).filter((key) => stripGen(key) === id)
+            .sort((a, b) => genOf(b) - genOf(a));
+        return hits[0] || null;
     }
 
     // "National Dex Godly Gift" / "National Dex Godly Gift + Custom": what the UI calls a format.
     function displayFormatName(format) {
         const [base, rules] = String(format || '').split('@@@');
         const baseKey = resolveFormatKey(base) || base;
-        const name = String(window.BattleFormats?.[baseKey]?.name || baseKey).replace(/^\[Gen \d+\]\s*/i, '');
+        // Keep historical generation labels visible: a Gen 3 OU custom team
+        // must not be confused with a current-generation OU team.
+        const officialName = String(window.BattleFormats?.[baseKey]?.name || baseKey);
+        const gen = formatGeneration(baseKey);
+        const plainName = officialName.replace(/^\[Gen\s+\d+\]\s*/i, '');
+        const name = gen && gen !== (window.Dex?.gen || 9) ? `[Gen ${gen}] ${plainName}` : plainName;
         return rules && rules.trim() ? getCustomFormatLabel(format) || name + ' + Custom' : name;
     }
 
@@ -7049,33 +7749,30 @@
 
     // -> {base, rules} or {error}
     function parseFormatImport(text, {currentFormat = ''} = {}) {
-        const s = String(text || '').trim().replace(/^\/(?:challenge|chall|utm)\s+/i, '');
+        let s = String(text || '').trim();
         if (!s) return {error: 'Paste a format first.'};
+        s = s.replace(/^\/(?:challenge|chall|utm)\s+/i, '').trim();
 
+        // Challenge lines can start with "Username, ". Never split the actual
+        // rule list on a comma unless separating the recipient *before* @@@.
         const at = s.indexOf('@@@');
-        let baseText = '';
-        let ruleText = '';
-        if (at >= 0) {
-            baseText = s.slice(0, at);
-            ruleText = s.slice(at + 3);
-        } else if (resolveFormatKey(squash(s.slice(s.lastIndexOf(',') + 1))) || /^\s*(?:\[Gen\s*\d+\]|gen\d+)/i.test(s)) {
-            baseText = s;
-        } else {
-            ruleText = s; // just rules: keep the team's current base format
-        }
-
-        // "/challenge Someone, gen9ou @@@ ..." -> the format is after the last comma.
-        if (baseText.includes(',')) baseText = baseText.slice(baseText.lastIndexOf(',') + 1);
-        baseText = squash(baseText);
-
-        const base = baseText ? resolveFormatKey(baseText) || baseText : String(currentFormat).split('@@@')[0];
-        if (!base) return {error: baseText ? `Unknown format "${baseText}".` : 'Open a team first, or include a format name.'};
-
-        // Keep the submitted payload verbatim; normalized tokens are only for analysis.
-        const rules = ruleText.split(',').map((t) => t.trim()).filter(Boolean);
-        const payload = at >= 0 ? s.slice(s.slice(0, at).lastIndexOf(',') + 1).trim()
-            : baseText ? s.slice(s.lastIndexOf(',') + 1).trim() : base + '@@@' + ruleText;
-        return {base, rules, format: payload};
+        const left = (at >= 0 ? s.slice(0, at) : s).trim();
+        const ruleText = at >= 0 ? s.slice(at + 3).trim() : '';
+        const candidate = left.slice(left.lastIndexOf(',') + 1).trim();
+        const preferredGen = formatGeneration(currentFormat);
+        const resolved = resolveFormatKey(candidate, preferredGen);
+        const baseLooksLikeFormat = !!resolved || /^\s*(?:\[\s*gen\s*\d+\s*\]|gen\s*\d+)/i.test(candidate);
+        const onlyRules = at < 0 && !baseLooksLikeFormat;
+        const base = (onlyRules || (at >= 0 && !candidate))
+            ? (resolveFormatKey(String(currentFormat || '').split('@@@')[0]) || String(currentFormat || '').split('@@@')[0].trim())
+            : (resolved || resolveFormatKey(candidate.replace(/^\[Gen\s*(\d+)\]/i, 'gen$1'), preferredGen));
+        if (!base) return {error: onlyRules
+            ? 'Open a team first, or include a format name.'
+            : `Unknown format "${candidate}". Use a Showdown format ID (e.g. gen4ou).`};
+        const rules = (onlyRules ? s : ruleText).split(',').map(squash).filter(Boolean);
+        // The saved format must use the native *ID*, not the display string or
+        // the original "/challenge" recipient, or Gen and Dex will drift.
+        return {base, rules, format: base + (rules.length ? '@@@' + rules.join(',') : '')};
     }
 
     // Puts `base@@@rules` on the open team (keeps the generation / dex in step).
@@ -7091,14 +7788,14 @@
         team.format = nextFormat;
         if (rules.length && customName) saveCustomFormatLabel(team.format, customName);
         if (!formatChanged) {
+            syncExplicitFormatGeneration(team);
             // A name change should not reset the editor or duplicate its rows.
             decorateCustomFormatNames();
             return true;
         }
-        if (newGen && newGen !== oldGen) {
-            team.gen = Number(newGen);
-            if (typeof Dex.forGen === 'function') team.dex = Dex.forGen(team.gen);
-        }
+        // Synchronize even when the format prefix is unchanged: team.gen can
+        // be stale after importing or reopening an existing custom-format team.
+        syncExplicitFormatGeneration(team);
 
         room.save?.();
         refreshAfterFormatChange(room);
@@ -7114,14 +7811,23 @@
         applyTeamFormat(room, parsed.base, parsed.rules, label, parsed.format);
 
         const count = (sign) => parsed.rules.filter((t) => t[0] === sign).length;
+        // If the live client has not shipped some newly introduced Mega data,
+        // do not silently claim that an import made those species usable.
+        const unresolvedForms = formatRuleTokens(parsed.format)
+            .filter((op) => op.kind === 'unban' && /-mega(?:-[a-z0-9]+)?$/i.test(op.name || '') &&
+                !Dex.species.get(op.name)?.exists)
+            .map((op) => op.name);
         return {
             ok: true,
             format: room.curTeam.format,
             label: displayFormatName(room.curTeam.format),
             mods: getActiveMods(room),
-            unknown: parsed.rules.filter(
-                (t) => !isBanRule(t) && !/clause/i.test(t) && !modsFromFormatString('gen9ou@@@' + t).length
-            ),
+            unresolvedForms,
+            unknown: parsed.rules.map(parseChallengeRule).filter((op) =>
+                op && !['ban', 'unban', 'restrict'].includes(op.kind) && !op.known
+            ).map((op) => op.raw),
+            rules: formatRuleTokens(room.curTeam.format),
+            generation: formatGeneration(room.curTeam.format, room.curTeam.gen),
             counts: {bans: count('-'), unbans: count('+'), restricted: count('*')},
         };
     }
@@ -7203,9 +7909,16 @@
                 if (res.counts.unbans) parts.push(`${res.counts.unbans} unban${res.counts.unbans > 1 ? 's' : ''}`);
                 if (res.counts.restricted) parts.push(`${res.counts.restricted} restricted`);
 
-                let note = `<p><strong>Now:</strong> ${selfEsc(res.label)}` +
+                let note = `<p><strong>Now:</strong> ${selfEsc(res.label)} (Gen ${res.generation || '?'})` +
                     (res.mods.length ? ` <span style="opacity:.75">(${selfEsc(res.mods.map(modLabel).join(' + '))})</span>` : '') +
                     '</p>';
+                const recognized = res.rules.filter((op) => op.known).length;
+                const values = res.rules.filter((op) => op.kind === 'value' || op.kind === 'replace').length;
+                const summary = [...parts, `${recognized} recognized rule${recognized === 1 ? '' : 's'}`,
+                    ...(values ? [`${values} value rule${values === 1 ? '' : 's'}`] : [])];
+                if (summary.length) note += `<p style="opacity:.75;font-size:12px">${selfEsc(summary.join(' · '))}</p>`;
+                if (res.unknown.length) note += `<p style="color:#b05522">Unrecognized rules: ${selfEsc(res.unknown.join(', '))}. The server is the final authority on whether these are valid.</p>`;
+                if (res.unresolvedForms.length) note += `<p style="color:#b05522">${res.unresolvedForms.length} unbanned Mega forme(s) are missing from this client’s current Pokédex (${selfEsc(res.unresolvedForms.slice(0, 8).join(', '))}${res.unresolvedForms.length > 8 ? ', …' : ''}). The format was imported, but those formes cannot be displayed until Showdown includes their data.</p>`;
                 this.draw(null, note, customName);
             },
 
@@ -10082,6 +10795,7 @@
             patchGetStat(),
             patchBattleStatOptimizerConstructor(),
             patchStatForm(),
+            patchCustomTeamGenerationRendering(),
             patchRenderSetTypeIcons(),
             patchChartSet(),
             patchMoveSearchSort(),
@@ -10132,6 +10846,30 @@
     window.qolFormat = {
         import: (text, room = getActiveTeambuilderRoom()) => importFormatText(room, text),
         bans: (room = getActiveTeambuilderRoom()) => getMergedBans(room),
+        // Useful when the move search and Showdown's /formathelp disagree.
+        // Explicit bans and restricted moves are separate categories.
+        checkMove: (moveName, room = getActiveTeambuilderRoom()) => {
+            const format = room?.curTeam?.format || '';
+            const dex = room?.curTeam?.dex || Dex;
+            const move = dex.moves.get(moveName);
+            if (!move?.exists) return {format, error: `Unknown move: ${moveName}`};
+            const bans = getMergedBansForFormat(format);
+            const entry = genericBanlists.get(genericBanFormatId(format));
+            return {format, move: move.name, generation: dex.gen,
+                serverBanlistVerified: !!entry?.verified,
+                generationAllowed: moveAllowedByGeneration(dex, move, format),
+                banned: !!bans?.moves?.has(move.id),
+                restricted: !!bans?.restrictedMoves?.has(move.id),
+                activeRules: bans ? [...resolveClauseRules(bans, format)] : [],
+            };
+        },
+        // Shows basic custom clause implications, but simulator validation is authoritative.
+        clauseBans: (room = getActiveTeambuilderRoom()) => {
+            const bans = getMergedBans(room);
+            if (!bans) return null;
+            return {moves: [...bans.moves], abilities: [...bans.abilities], items: [...bans.items],
+                types: [...bans.types], teraTypes: [...bans.teraTypes]};
+        },
         // qolFormat.explain('Dragapult'): which rule bans / restricts it, and whether the base list loaded.
         explain: (name, room = getActiveTeambuilderRoom()) => {
             const format = room?.curTeam?.format;
@@ -10157,6 +10895,32 @@
             };
         },
         parse: parseFormatImport,
+        rule: parseChallengeRule,
+        rules: (format = getActiveTeambuilderRoom()?.curTeam?.format) => formatRuleTokens(format),
+        diagnoseMegamons: (format = getActiveTeambuilderRoom()?.curTeam?.format) => {
+            const bans = getMergedBansForFormat(format);
+            const unbans = new Set(explicitlyUnbannedForms(format));
+            if (bans) for (const id of bans.unbanned) unbans.add(id);
+            const megaIds = [...unbans].filter((id) => /mega/.test(id));
+            const unknown = megaIds.filter((id) => !Dex.species.get(id)?.exists);
+            const entry = genericBanlists.get(genericBanFormatId(format));
+            const legal = megamonsLegalMegaIds(format, getActiveTeambuilderRoom()?.curTeam?.dex || Dex);
+            return {format, active: isConvergenceMegamons(format), generation: formatGeneration(format),
+                serverBanlistVerified: !!entry?.verified,
+                megaUnbans: megaIds.length, recognizedMegas: megaIds.length - unknown.length,
+                visibleLegalMegas: legal.size, missingFromClientDex: unknown, mods: modsFromFormatString(format)};
+        },
+        effectiveRules: (format = getActiveTeambuilderRoom()?.curTeam?.format) => {
+            const state = explicitRuleState(format);
+            const bans = getMergedBansForFormat(format);
+            const entry = genericBanlists.get(genericBanFormatId(format));
+            return {active: [...state.active.values()], removed: [...state.removed],
+                resolved: bans ? [...resolveClauseRules(bans, format)] : [],
+                serverBanlistVerified: !!entry?.verified, generation: formatGeneration(format)};
+        },
+        catalog: () => [...RULE_CATALOG.values()].map((rule) => ({...rule})),
+        // These are client-side preview providers, not a complete simulator.
+        clientSupported: () => MOD_DEFINITIONS.map(({id, label, challengeRule}) => ({id, label, challengeRule})),
         active: (room = getActiveTeambuilderRoom()) => getActiveMods(room),
         typemons: (room = getActiveTeambuilderRoom()) => typemonsType(room),
         remove: (room = getActiveTeambuilderRoom()) => removeCustomRules(room),
